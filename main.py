@@ -3,6 +3,7 @@ from flask import Flask, jsonify, render_template_string, request
 import builtins
 import hashlib
 import hmac
+import math
 import os
 import sys
 import threading
@@ -18,6 +19,7 @@ RUNTIME_CONFIG = validate_runtime_environment()
 app = Flask(__name__)
 SYMBOLS = {"US100": "^NDX", "US500": "^GSPC"}
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "60"))
+PAPER_CURRENCY = os.environ.get("PAPER_CURRENCY", "EUR").strip().upper() or "EUR"
 config = RiskConfig(
     starting_balance=float(os.environ.get("PAPER_STARTING_BALANCE", "100")),
     risk_per_trade=float(os.environ.get("RISK_PER_TRADE", "0.005")),
@@ -93,32 +95,54 @@ def analyze_market(symbol, ticker):
         return {"symbol": symbol, "signal": "WAIT", "error": str(exc), "updated": None}
 
 
+def fresh_market_quote(market):
+    """Return a normalized quote only when both price and timestamp are trustworthy."""
+    if market.get("error"):
+        return None
+    try:
+        price = float(market.get("price"))
+        age = float(market.get("data_age_seconds"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0 or not math.isfinite(age) or age < 0:
+        return None
+    if age > config.max_data_age_seconds:
+        return None
+    return price, age
+
+
 def process_market_cycle():
     results = {s: analyze_market(s, ticker) for s, ticker in SYMBOLS.items()}
-    prices = {s: x["price"] for s, x in results.items() if x.get("price") is not None}
+    fresh_quotes = {symbol: quote for symbol, market in results.items()
+                    if (quote := fresh_market_quote(market)) is not None}
+    fresh_prices = {symbol: quote[0] for symbol, quote in fresh_quotes.items()}
+    stale_symbols = [symbol for symbol in results if symbol not in fresh_quotes]
     with market_lock:
         markets.clear()
         markets.update(results)
-    engine.set_prices(prices)
-    engine.check_exits(prices)
-    stale_symbols = [symbol for symbol, market in results.items()
-                     if market.get("data_age_seconds") is None or market["data_age_seconds"] > config.max_data_age_seconds]
+    engine.set_prices(fresh_prices)
+    engine.check_exits(fresh_prices)
     if stale_symbols:
-        engine.set_market_warning(f"Stale or unavailable market data for {', '.join(stale_symbols)}; all new positions blocked; existing positions require attention")
-        return
+        affected_positions = sorted(set(stale_symbols).intersection(engine.positions))
+        warning = (f"Stale or unavailable market data for {', '.join(stale_symbols)}; "
+                   "new entries and automatic exits blocked for affected instruments")
+        if affected_positions:
+            warning += f"; open positions require attention: {', '.join(affected_positions)}"
+        engine.set_market_warning(warning)
     for symbol, market in results.items():
-        age = market.get("data_age_seconds")
+        if symbol not in fresh_quotes:
+            continue
         if market.get("signal") not in ("BUY", "SELL"):
             continue
         signal_id = hashlib.sha256(f"{symbol}|{market['updated']}|{market['signal']}".encode()).hexdigest()
         signal = {**market, "signal_id": signal_id, "created_at": utc_now()}
         engine.record_signal(signal)
-        engine.open_position(symbol, market["signal"], market["price"], signal_id=signal_id,
+        price, age = fresh_quotes[symbol]
+        engine.open_position(symbol, market["signal"], price, signal_id=signal_id,
                              spread_rate=market.get("spread_rate"), data_age_seconds=age)
-    if not any("error" not in row for row in results.values()):
-        engine.set_market_warning("Market data unavailable for all symbols")
-    else:
-        engine.set_market_warning(None)
+    if stale_symbols:
+        return
+    engine.set_market_warning(None)
 
 
 def market_monitor():
@@ -149,7 +173,7 @@ DASHBOARD = """<!doctype html><html><head><meta name="viewport" content="width=d
 <div class="grid" id="summary"></div><div class="card"><h3>Tržišni signali</h3><div id="markets"></div></div><div class="card"><h3>Otvorene pozicije</h3><div id="positions"></div></div><div class="card"><h3>Poslednje trgovine</h3><div id="trades"></div></div><p class="muted" id="updated"></p>
 <script>
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function load(){try{const r=await fetch('/status');const d=await r.json();const money=n=>Number(n||0).toFixed(2)+' '+(d.currency||'USD');
+async function load(){try{const r=await fetch('/status');const d=await r.json();const money=n=>Number(n||0).toFixed(2)+' '+(d.currency||'EUR');
 document.getElementById('summary').innerHTML=[['Stanje',money(d.balance)],['Vrednost računa',money(d.equity)],['Realizovani P/L',money(d.realized_pnl)],['Nerealizovani P/L',money(d.unrealized_pnl)],['Režim',d.mode],['Emergency STOP',d.risk?.emergency_stop?'AKTIVAN':'isključen']].map(x=>'<div class="card"><div class="muted">'+esc(x[0])+'</div><div class="value">'+esc(x[1])+'</div></div>').join('');
 document.getElementById('warning').textContent=d.risk?.market_warning||d.risk?.pause_reason||'';
 document.getElementById('markets').innerHTML=Object.values(d.markets).map(m=>'<p><b>'+esc(m.symbol)+'</b> · '+esc(m.price??'—')+' · <b class="'+(m.signal==='BUY'?'buy':m.signal==='SELL'?'sell':'')+'">'+esc(m.signal)+'</b> · RSI '+esc(m.rsi??'—')+(m.error?' · '+esc(m.error):'')+(m.data_age_seconds!=null?' · starost '+Math.round(m.data_age_seconds)+'s':'')+'</p>').join('')||'Nema podataka';
@@ -169,11 +193,12 @@ def dashboard():
 def status():
     with market_lock:
         current = {k: dict(v) for k, v in markets.items()}
-    prices = {k: v["price"] for k, v in current.items() if v.get("price") is not None}
+    prices = {symbol: quote[0] for symbol, market in current.items()
+              if (quote := fresh_market_quote(market)) is not None}
     data = engine.snapshot(prices)
     data.update({"name": "AI Trading Bot V3", "mode": "PAPER TRADING ONLY", "status": "RUNNING" if monitor_started else "STARTING",
                  "starting_capital": engine.state["starting_balance"], "markets": current,
-                 "currency": os.environ.get("PAPER_CURRENCY", "USD"),
+                 "currency": PAPER_CURRENCY,
                  "positions": data["positions"], "last_update": max((m.get("updated") or "" for m in current.values()), default=None),
                  "last_error": next((m["error"] for m in current.values() if m.get("error")), None)})
     return jsonify(data)
@@ -200,8 +225,7 @@ def health():
     risk = engine.risk_status()
     with market_lock:
         current = list(markets.values())
-    has_fresh_market = any(m.get("price") is not None and m.get("data_age_seconds", float("inf")) <= config.max_data_age_seconds
-                           and not m.get("error") for m in current)
+    has_fresh_market = any(fresh_market_quote(market) is not None for market in current)
     status = "starting" if not monitor_started else "degraded" if risk.get("market_warning") or not has_fresh_market else "healthy"
     return jsonify({"status": status, "mode": "PAPER_ONLY", "risk": risk})
 
@@ -241,9 +265,12 @@ def manual_paper_order():
         return jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"}), 401
     body = request.get_json(silent=True) or {}
     market = markets.get(body.get("symbol"), {})
-    result = engine.open_position(body.get("symbol"), body.get("side"), market.get("price"),
+    quote = fresh_market_quote(market)
+    if quote is None:
+        return jsonify({"ok": False, "reason": "STALE_MARKET_DATA"}), 409
+    result = engine.open_position(body.get("symbol"), body.get("side"), quote[0],
                                  signal_id=body.get("signal_id"), spread_rate=market.get("spread_rate"),
-                                 data_age_seconds=market.get("data_age_seconds"))
+                                 data_age_seconds=quote[1])
     return jsonify(result), paper_result_status(result)
 
 
@@ -251,7 +278,11 @@ def manual_paper_order():
 def close_paper_position(symbol):
     if not require_paper_token():
         return jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"}), 401
-    result = engine.close_position(symbol, markets.get(symbol, {}).get("price"), "MANUAL")
+    market = markets.get(symbol, {})
+    quote = fresh_market_quote(market)
+    if quote is None:
+        return jsonify({"ok": False, "reason": "STALE_MARKET_DATA"}), 409
+    result = engine.close_position(symbol, quote[0], "MANUAL")
     return jsonify(result), paper_result_status(result)
 
 

@@ -20,7 +20,7 @@ Render Persistent Disks require a paid service; the Free web service filesystem 
 
 ## PAPER controls
 
-Risk settings can be configured with `PAPER_STARTING_BALANCE`, `PAPER_CURRENCY`, `RISK_PER_TRADE`, `MAX_DAILY_LOSS`, `MAX_TOTAL_RISK`, `MAX_OPEN_POSITIONS`, `MAX_NOTIONAL_MULTIPLE`, `STOP_LOSS_PCT`, `TAKE_PROFIT_PCT`, `PAPER_FEE_RATE`, `PAPER_SLIPPAGE_RATE`, `MAX_SPREAD_RATE`, `PAPER_ASSUMED_SPREAD_RATE`, and `MAX_DATA_AGE_SECONDS`. yfinance does not provide bid/ask quotes here; spread is therefore an explicit paper estimate, not a measured market spread.
+Risk settings can be configured with `PAPER_STARTING_BALANCE`, `PAPER_CURRENCY`, `RISK_PER_TRADE`, `MAX_DAILY_LOSS`, `MAX_TOTAL_RISK`, `MAX_OPEN_POSITIONS`, `MAX_NOTIONAL_MULTIPLE`, `STOP_LOSS_PCT`, `TAKE_PROFIT_PCT`, `PAPER_FEE_RATE`, `PAPER_SLIPPAGE_RATE`, `MAX_SPREAD_RATE`, `PAPER_ASSUMED_SPREAD_RATE`, and `MAX_DATA_AGE_SECONDS`. The account and dashboard currency default to `EUR`; set `PAPER_CURRENCY` explicitly to another currency when needed. yfinance does not provide bid/ask quotes here; spread is therefore an explicit paper estimate, not a measured market spread.
 
 The token-protected PAPER control endpoints are `POST /paper/emergency-stop`, `POST /paper/resume`, `POST /paper/orders`, and `POST /paper/positions/<symbol>/close`. These routes only change simulator state. Emergency STOP is persisted and blocks new positions until explicitly resumed; the daily-loss limit cannot be resumed while still breached. The API token is never included in application log messages or the Render Blueprint.
 

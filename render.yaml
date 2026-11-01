@@ -23,3 +23,5 @@ services:
         value: "true"
       - key: PAPER_STARTING_BALANCE
         value: "100"
+      - key: PAPER_CURRENCY
+        value: EUR

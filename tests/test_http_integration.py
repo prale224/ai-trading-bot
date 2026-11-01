@@ -19,6 +19,7 @@ from risk_engine import PaperRiskEngine, RiskConfig
 def service(tmp_path, monkeypatch):
     monkeypatch.setenv("PAPER_DB_PATH", str(tmp_path / "http-test.sqlite3"))
     monkeypatch.setenv("PAPER_API_TOKEN", "integration-test-token-with-at-least-32-characters")
+    monkeypatch.delenv("PAPER_CURRENCY", raising=False)
     import main
     main = importlib.reload(main)
     monkeypatch.setattr(main, "start_monitor", lambda: None)
@@ -42,9 +43,18 @@ def test_read_only_http_routes_and_dashboard(service):
     assert status.status_code == 200
     assert status.json["mode"] == "PAPER TRADING ONLY"
     assert status.json["balance"] == 100
+    assert status.json["currency"] == "EUR"
     assert client.get("/signals").json["US100"]["signal"] == "WAIT"
     assert client.get("/positions").json == {}
     assert client.get("/trades").json == []
+
+
+def test_paper_currency_can_be_configured_explicitly(service, monkeypatch):
+    main, _ = service
+    monkeypatch.setenv("PAPER_CURRENCY", "CAD")
+    main = importlib.reload(main)
+    monkeypatch.setattr(main, "start_monitor", lambda: None)
+    assert main.app.test_client().get("/status").json["currency"] == "CAD"
 
 
 def test_health_is_degraded_without_fresh_market_data(service):
@@ -97,13 +107,80 @@ def test_stale_or_missing_market_data_blocks_new_positions(service, monkeypatch)
     })
     main.process_market_cycle()
     assert main.engine.positions == {}
-    assert "all new positions blocked" in main.engine.risk_status()["market_warning"]
+    assert "blocked for affected instruments" in main.engine.risk_status()["market_warning"]
 
     monkeypatch.setattr(main, "analyze_market", lambda symbol, ticker: {
         "symbol": symbol, "signal": "BUY", "error": "No market data", "updated": None,
     })
     main.process_market_cycle()
     assert main.engine.positions == {}
+
+
+def test_stale_market_data_does_not_block_fresh_instrument(service, monkeypatch):
+    main, _ = service
+
+    def fake_market(symbol, ticker):
+        if symbol == "US100":
+            return {"symbol": symbol, "price": 20000, "signal": "BUY",
+                    "updated": "2026-11-01T12:00:00+00:00", "data_age_seconds": 10_000,
+                    "spread_rate": 0.0002}
+        return {"symbol": symbol, "price": 5000, "signal": "BUY",
+                "updated": "2026-11-01T12:00:00+00:00", "data_age_seconds": 1,
+                "spread_rate": 0.0002}
+
+    monkeypatch.setattr(main, "analyze_market", fake_market)
+    main.process_market_cycle()
+
+    assert "US100" not in main.engine.positions
+    assert "US500" in main.engine.positions
+    assert len(main.engine.state["signals"]) == 1
+    assert main.engine.state["signals"][0]["symbol"] == "US500"
+    assert "US100" in main.engine.risk_status()["market_warning"]
+
+
+def test_stale_price_crossing_stop_loss_does_not_close_position(service, monkeypatch):
+    main, _ = service
+    opened = main.engine.open_position("US100", "BUY", 20000, signal_id="stale-exit",
+                                        spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+    main.engine.set_prices({"US100": 20000})
+    stop_loss = opened["position"]["stop_loss"]
+
+    def fake_market(symbol, ticker):
+        if symbol == "US100":
+            return {"symbol": symbol, "price": stop_loss - 100, "signal": "WAIT",
+                    "updated": "2026-11-01T12:00:00+00:00", "data_age_seconds": 10_000,
+                    "spread_rate": 0.0002}
+        return {"symbol": symbol, "price": 5000, "signal": "WAIT",
+                "updated": "2026-11-01T12:00:00+00:00", "data_age_seconds": 1,
+                "spread_rate": 0.0002}
+
+    monkeypatch.setattr(main, "analyze_market", fake_market)
+    main.process_market_cycle()
+
+    assert "US100" in main.engine.positions
+    assert main.engine.state["trades"] == []
+    warning = main.engine.risk_status()["market_warning"]
+    assert "US100" in warning
+    assert "open positions require attention" in warning
+
+
+def test_fresh_price_crossing_stop_loss_still_closes_position(service, monkeypatch):
+    main, _ = service
+    opened = main.engine.open_position("US100", "BUY", 20000, signal_id="fresh-exit",
+                                        spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+    stop_loss = opened["position"]["stop_loss"]
+    monkeypatch.setattr(main, "analyze_market", lambda symbol, ticker: {
+        "symbol": symbol, "price": stop_loss - 100 if symbol == "US100" else 5000,
+        "signal": "WAIT", "updated": "2026-11-01T12:00:00+00:00",
+        "data_age_seconds": 1, "spread_rate": 0.0002,
+    })
+
+    main.process_market_cycle()
+
+    assert "US100" not in main.engine.positions
+    assert main.engine.state["trades"][0]["reason"] == "STOP_LOSS"
 
 
 def _free_port():

@@ -5,6 +5,7 @@ This module has no broker adapter and cannot submit external orders.
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from copy import deepcopy
+import math
 import threading
 
 
@@ -86,12 +87,20 @@ class PaperRiskEngine:
         today = self._today()
         if self.state["day"] != today:
             self.state["day"] = today
-            self.state["day_start_equity"] = self.equity({})
+            self.state["day_start_equity"] = self.equity()
             self.state["daily_realized_pnl"] = 0.0
 
     def equity(self, prices=None):
-        prices = prices if prices is not None else self.state.get("last_prices", {})
-        unrealized = sum((prices.get(s, p["entry_price"])-p["entry_price"])
+        effective_prices = dict(self.state.get("last_prices", {}))
+        if prices:
+            for symbol, value in prices.items():
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value) and value > 0:
+                    effective_prices[symbol] = value
+        unrealized = sum((effective_prices.get(s, p["entry_price"])-p["entry_price"])
                          * (1 if p["side"] == "BUY" else -1) * p["quantity"]
                          for s, p in self.positions.items())
         return self.balance + unrealized
@@ -153,9 +162,10 @@ class PaperRiskEngine:
             if len(self.positions) >= self.config.max_open_positions:
                 return {"ok": False, "reason": "MAX_OPEN_POSITIONS"}
             stop_dist = market_price * self.config.stop_loss_pct
-            risk_cash = max(0, self.equity({})) * self.config.risk_per_trade
+            current_equity = max(0, self.equity())
+            risk_cash = current_equity * self.config.risk_per_trade
             open_risk = sum(p["quantity"] * abs(p["entry_price"]-p["stop_loss"]) for p in self.positions.values())
-            allowed_risk = max(0, self.equity({})*self.config.max_total_risk-open_risk)
+            allowed_risk = max(0, current_equity*self.config.max_total_risk-open_risk)
             qty_risk = min(risk_cash, allowed_risk) / stop_dist
             entry_cost_factor = 1+self.config.fee_rate+self.config.slippage_rate+spread_rate/2
             qty_cash = max(self.balance, 0)*self.config.max_notional_multiple/(market_price*entry_cost_factor)
@@ -238,7 +248,15 @@ class PaperRiskEngine:
 
     def set_prices(self, prices):
         with self.lock:
-            self.state["last_prices"] = dict(prices)
+            valid_prices = {}
+            for symbol, price in prices.items():
+                try:
+                    price = float(price)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(price) and price > 0:
+                    valid_prices[symbol] = price
+            self.state.setdefault("last_prices", {}).update(valid_prices)
             if self._daily_limit_hit():
                 self.state.update(paused=True, pause_reason="DAILY_LOSS_LIMIT")
             self._persist()

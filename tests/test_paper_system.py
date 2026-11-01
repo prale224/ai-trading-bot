@@ -59,6 +59,42 @@ class PaperSystemTests(unittest.TestCase):
         self.assertEqual(self.engine.risk_status()["pause_reason"], "DAILY_LOSS_LIMIT")
         self.assertEqual(self.open_buy(signal_id="signal-2")["reason"], "DAILY_LOSS_LIMIT")
 
+    def test_position_sizing_uses_unrealized_pnl_in_current_equity(self):
+        cfg = RiskConfig(starting_balance=100, risk_per_trade=0.10, max_daily_loss=0.50,
+                         max_total_risk=0.50, max_open_positions=2, max_notional_multiple=10,
+                         stop_loss_pct=0.10, take_profit_pct=0.20, fee_rate=0,
+                         slippage_rate=0, assumed_spread_rate=0, max_spread_rate=0.001)
+        engine = PaperRiskEngine(PaperStore(Path(self.temp.name) / "unrealized-sizing.sqlite3"), cfg)
+        first = engine.open_position("US100", "BUY", 100, signal_id="unrealized-first",
+                                      spread_rate=0, data_age_seconds=1)
+        self.assertTrue(first["ok"])
+        engine.set_prices({"US100": 150})
+        self.assertEqual(engine.equity(), 150)
+
+        second = engine.open_position("US500", "BUY", 100, signal_id="unrealized-second",
+                                       spread_rate=0, data_age_seconds=1)
+
+        self.assertTrue(second["ok"])
+        self.assertAlmostEqual(second["position"]["quantity"], 1.5)
+
+    def test_day_rollover_uses_last_valid_prices_for_starting_equity(self):
+        cfg = RiskConfig(starting_balance=100, risk_per_trade=0.01, max_daily_loss=0.50,
+                         max_total_risk=0.50, max_notional_multiple=2, stop_loss_pct=0.01,
+                         take_profit_pct=0.02, fee_rate=0, slippage_rate=0,
+                         assumed_spread_rate=0, max_spread_rate=0.001)
+        engine = PaperRiskEngine(PaperStore(Path(self.temp.name) / "day-rollover.sqlite3"), cfg)
+        self.assertTrue(engine.open_position("US100", "BUY", 100, signal_id="rollover",
+                                             spread_rate=0, data_age_seconds=1)["ok"])
+        engine.set_prices({"US100": 99})
+        self.assertEqual(engine.equity(), 99)
+        engine.state["daily_realized_pnl"] = 12
+        engine._today = lambda: "2099-01-01"
+
+        engine._roll_day()
+
+        self.assertEqual(engine.state["day_start_equity"], 99)
+        self.assertEqual(engine.state["daily_realized_pnl"], 0)
+
     def test_stale_data_and_excessive_spread_are_rejected(self):
         result = self.engine.open_position("US100", "BUY", 100, signal_id="s1", spread_rate=0.0001, data_age_seconds=181)
         self.assertEqual(result["reason"], "STALE_MARKET_DATA")
