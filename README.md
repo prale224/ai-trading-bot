@@ -18,6 +18,8 @@ The checked-in `render.yaml` configures a single paid Starter web instance, one 
 
 Render Persistent Disks require a paid service; the Free web service filesystem is ephemeral. Only files under the mount path survive restarts and deploys. The single attached disk also means this service must stay at one instance. See [Render Persistent Disks](https://render.com/docs/disks) and the [Render Blueprint reference](https://render.com/docs/blueprint-spec).
 
+For isolated Free-tier testing, use the separate `render-free.yaml` Blueprint on branch `paper-trading-integration`. It creates a service named `ai-trading-bot-free`, uses `PAPER_ALLOW_EPHEMERAL_DB=true` and `/tmp/paper_trading.sqlite3`, and has no persistent disk. SQLite state, including paper positions and trade history, is lost when the Free service restarts, spins down, or redeploys. The paid `render.yaml` remains unchanged.
+
 ## PAPER controls
 
 Risk settings can be configured with `PAPER_STARTING_BALANCE`, `PAPER_CURRENCY`, `RISK_PER_TRADE`, `MAX_DAILY_LOSS`, `MAX_TOTAL_RISK`, `MAX_OPEN_POSITIONS`, `MAX_NOTIONAL_MULTIPLE`, `STOP_LOSS_PCT`, `TAKE_PROFIT_PCT`, `PAPER_FEE_RATE`, `PAPER_SLIPPAGE_RATE`, `MAX_SPREAD_RATE`, `PAPER_ASSUMED_SPREAD_RATE`, and `MAX_DATA_AGE_SECONDS`. The account and dashboard currency default to `EUR`; set `PAPER_CURRENCY` explicitly to another currency when needed. yfinance does not provide bid/ask quotes here; spread is therefore an explicit paper estimate, not a measured market spread.

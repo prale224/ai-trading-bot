@@ -2,11 +2,18 @@
 import os
 from pathlib import Path
 
+EPHEMERAL_DB_PATH = "/tmp/paper_trading.sqlite3"
+
 
 def validate_runtime_environment(environ=None):
     environ = os.environ if environ is None else environ
     token = environ.get("PAPER_API_TOKEN", "").strip()
     db_path = environ.get("PAPER_DB_PATH", "").strip()
+    allow_ephemeral_db = environ.get("PAPER_ALLOW_EPHEMERAL_DB", "").strip().lower() == "true"
+    if allow_ephemeral_db:
+        if db_path and db_path != EPHEMERAL_DB_PATH:
+            raise RuntimeError(f"PAPER_DB_PATH must be {EPHEMERAL_DB_PATH} when PAPER_ALLOW_EPHEMERAL_DB=true")
+        db_path = EPHEMERAL_DB_PATH
     missing = [name for name, value in (("PAPER_API_TOKEN", token), ("PAPER_DB_PATH", db_path)) if not value]
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
@@ -17,7 +24,7 @@ def validate_runtime_environment(environ=None):
         raise RuntimeError("PAPER_DB_PATH must be an absolute path")
 
     on_render = any(environ.get(key) for key in ("RENDER", "RENDER_SERVICE_ID", "RENDER_EXTERNAL_URL"))
-    require_disk = on_render or environ.get("PAPER_REQUIRE_PERSISTENT_DB", "").lower() == "true"
+    require_disk = (on_render or environ.get("PAPER_REQUIRE_PERSISTENT_DB", "").strip().lower() == "true") and not allow_ephemeral_db
     if require_disk:
         mount = Path(environ.get("PAPER_PERSISTENT_DISK_PATH", "/var/data")).resolve()
         target = Path(db_path).resolve()
@@ -25,4 +32,5 @@ def validate_runtime_environment(environ=None):
             raise RuntimeError(f"PAPER_DB_PATH must be inside the mounted persistent disk: {mount}")
 
     # The returned config intentionally contains no trading-mode switch and no secret.
-    return {"database_path": db_path, "paper_only": True}
+    return {"database_path": db_path, "paper_only": True,
+            "ephemeral_database": allow_ephemeral_db}

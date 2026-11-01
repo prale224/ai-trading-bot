@@ -6,15 +6,26 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 
+EPHEMERAL_DB_PATH = "/tmp/paper_trading.sqlite3"
+
 
 def resolve_database_path():
-    configured = os.environ.get("PAPER_DB_PATH")
+    configured = os.environ.get("PAPER_DB_PATH", "").strip()
+    allow_ephemeral_db = os.environ.get("PAPER_ALLOW_EPHEMERAL_DB", "").strip().lower() == "true"
     on_render = any(os.environ.get(key) for key in ("RENDER", "RENDER_SERVICE_ID", "RENDER_EXTERNAL_URL"))
-    if (on_render or os.environ.get("PAPER_REQUIRE_PERSISTENT_DB") == "true") and not configured:
+    if allow_ephemeral_db:
+        if configured and configured != EPHEMERAL_DB_PATH:
+            raise RuntimeError(f"PAPER_DB_PATH must be {EPHEMERAL_DB_PATH} when PAPER_ALLOW_EPHEMERAL_DB=true")
+        path = Path(EPHEMERAL_DB_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    require_disk = on_render or os.environ.get("PAPER_REQUIRE_PERSISTENT_DB", "").strip().lower() == "true"
+    if require_disk and not configured:
         raise RuntimeError("PAPER_DB_PATH must point to a Render Persistent Disk (for example /var/data/paper.sqlite3)")
-    if (on_render or os.environ.get("PAPER_REQUIRE_PERSISTENT_DB") == "true") and configured and not Path(configured).is_absolute():
+    if require_disk and configured and not (Path(configured).is_absolute() or configured.startswith("/")):
         raise RuntimeError("On Render, PAPER_DB_PATH must be an absolute path on the mounted Persistent Disk")
-    if (on_render or os.environ.get("PAPER_REQUIRE_PERSISTENT_DB") == "true") and configured:
+    if require_disk and configured:
         mount = Path(os.environ.get("PAPER_PERSISTENT_DISK_PATH", "/var/data")).resolve()
         target = Path(configured).resolve()
         if target != mount and mount not in target.parents:

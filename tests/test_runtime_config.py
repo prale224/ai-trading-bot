@@ -7,6 +7,7 @@ import sys
 
 import pytest
 
+from database import resolve_database_path
 from runtime_config import validate_runtime_environment
 
 
@@ -44,6 +45,70 @@ def test_render_db_must_live_under_persistent_disk():
     assert validate_runtime_environment(base)["paper_only"] is True
     with pytest.raises(RuntimeError, match="mounted persistent disk"):
         validate_runtime_environment({**base, "PAPER_DB_PATH": "/tmp/paper.sqlite3"})
+
+
+def test_ephemeral_render_database_requires_explicit_allow_flag():
+    base = {"PAPER_API_TOKEN": TOKEN, "PAPER_DB_PATH": "/tmp/paper_trading.sqlite3",
+            "RENDER_SERVICE_ID": "srv-paper-test", "PAPER_REQUIRE_PERSISTENT_DB": "false"}
+    with pytest.raises(RuntimeError, match="mounted persistent disk"):
+        validate_runtime_environment(base)
+
+    accepted = validate_runtime_environment({**base, "PAPER_ALLOW_EPHEMERAL_DB": "true"})
+    assert accepted["database_path"] == "/tmp/paper_trading.sqlite3"
+    assert accepted["ephemeral_database"] is True
+    assert accepted["paper_only"] is True
+
+
+def test_ephemeral_mode_uses_only_the_fixed_tmp_database_path():
+    base = {"PAPER_API_TOKEN": TOKEN, "RENDER_SERVICE_ID": "srv-paper-test",
+            "PAPER_ALLOW_EPHEMERAL_DB": "true"}
+    assert validate_runtime_environment(base)["database_path"] == "/tmp/paper_trading.sqlite3"
+    with pytest.raises(RuntimeError, match="PAPER_DB_PATH must be /tmp/paper_trading.sqlite3"):
+        validate_runtime_environment({**base, "PAPER_DB_PATH": "/tmp/other.sqlite3"})
+
+
+def test_database_resolver_uses_ephemeral_path_only_when_explicitly_allowed(monkeypatch):
+    monkeypatch.setenv("RENDER_SERVICE_ID", "srv-paper-test")
+    monkeypatch.setenv("PAPER_REQUIRE_PERSISTENT_DB", "false")
+    monkeypatch.setenv("PAPER_ALLOW_EPHEMERAL_DB", "false")
+    monkeypatch.setenv("PAPER_DB_PATH", "/tmp/paper_trading.sqlite3")
+    monkeypatch.setattr("database.Path.mkdir", lambda self, *args, **kwargs: None)
+    with pytest.raises(RuntimeError, match="inside the Render Persistent Disk mount"):
+        resolve_database_path()
+
+    monkeypatch.setenv("PAPER_ALLOW_EPHEMERAL_DB", "true")
+    monkeypatch.delenv("PAPER_DB_PATH", raising=False)
+    assert resolve_database_path().as_posix() == "/tmp/paper_trading.sqlite3"
+
+    monkeypatch.setenv("PAPER_DB_PATH", "/tmp/other.sqlite3")
+    with pytest.raises(RuntimeError, match="PAPER_DB_PATH must be /tmp/paper_trading.sqlite3"):
+        resolve_database_path()
+
+
+def test_free_render_blueprint_is_separate_and_keeps_paid_blueprint_unchanged():
+    root = Path(__file__).resolve().parents[1]
+    free_text = (root / "render-free.yaml").read_text(encoding="utf-8")
+    paid_text = (root / "render.yaml").read_text(encoding="utf-8")
+    assert "name: ai-trading-bot-free" in free_text
+    assert "branch: paper-trading-integration" in free_text
+    assert "plan: free" in free_text
+    assert "PAPER_DB_PATH" in free_text and "/tmp/paper_trading.sqlite3" in free_text
+    assert "PAPER_ALLOW_EPHEMERAL_DB" in free_text and 'value: "true"' in free_text
+    assert "PAPER_CURRENCY" in free_text and "value: EUR" in free_text
+    assert "disk:" not in free_text
+    assert 'autoDeployTrigger: "off"' in free_text
+    assert "plan: starter" in paid_text
+    assert "mountPath: /var/data" in paid_text
+
+
+def test_application_has_no_broker_sdk_or_order_submission_calls():
+    root = Path(__file__).resolve().parents[1]
+    source_files = ("main.py", "database.py", "risk_engine.py", "runtime_config.py", "requirements.txt")
+    forbidden = ("metatrader5", "alpaca", "ib_insync", "ccxt", "order_send(", "create_order(", "place_order(")
+    for filename in source_files:
+        contents = (root / filename).read_text(encoding="utf-8").lower()
+        for pattern in forbidden:
+            assert pattern not in contents, f"Unexpected broker integration pattern in {filename}: {pattern}"
 
 
 def test_wsgi_app_is_callable_and_render_uses_single_worker(tmp_path, monkeypatch):
