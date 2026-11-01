@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: paper-trading-bot
+    runtime: python
+    plan: starter
+    numInstances: 1
+    autoDeployTrigger: "off"
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT --access-logfile - --error-logfile - main:app
+    healthCheckPath: /health
+    disk:
+      name: paper-trading-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PAPER_API_TOKEN
+        generateValue: true
+      - key: PAPER_DB_PATH
+        value: /var/data/paper_trading.sqlite3
+      - key: PAPER_PERSISTENT_DISK_PATH
+        value: /var/data
+      - key: PAPER_REQUIRE_PERSISTENT_DB
+        value: "true"
+      - key: PAPER_STARTING_BALANCE
+        value: "100"
