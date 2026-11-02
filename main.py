@@ -12,6 +12,7 @@ import pandas as pd
 import yfinance as yf
 
 from database import PaperStore
+from market_data import MarketDataCache
 from risk_engine import PaperRiskEngine, RiskConfig
 from runtime_config import validate_runtime_environment
 
@@ -37,6 +38,12 @@ config = RiskConfig(
 )
 store = PaperStore()
 engine = PaperRiskEngine(store, config)
+market_data_cache = MarketDataCache(
+    max_data_age_seconds=config.max_data_age_seconds,
+    min_fetch_interval_seconds=float(os.environ.get("YF_MIN_FETCH_INTERVAL_SECONDS", "60")),
+    backoff_base_seconds=float(os.environ.get("YF_BACKOFF_BASE_SECONDS", "60")),
+    backoff_max_seconds=float(os.environ.get("YF_BACKOFF_MAX_SECONDS", "900")),
+)
 markets = {}
 market_lock = threading.RLock()
 monitor_started = False
@@ -59,50 +66,101 @@ def calculate_rsi(series, period=14):
     return 100 - 100/(1+rs)
 
 
+def _analyze_market_uncached(symbol, ticker):
+    # Ticker.history propagates YFRateLimitError in the installed yfinance 1.7.0;
+    # yf.download catches per-ticker exceptions and returns an empty frame.
+    df = yf.Ticker(ticker).history(period="5d", interval="1m", actions=False,
+                                  auto_adjust=True, timeout=10)
+    if df.empty:
+        return {"symbol": symbol, "signal": "WAIT", "error": "No market data", "updated": None}
+    close = df["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    close = close.dropna()
+    if len(close) < 35:
+        return {"symbol": symbol, "signal": "WAIT", "error": "Not enough candles", "updated": None}
+    ema9, ema21 = close.ewm(span=9, adjust=False).mean(), close.ewm(span=21, adjust=False).mean()
+    rsi = calculate_rsi(close)
+    macd = close.ewm(span=12, adjust=False).mean()-close.ewm(span=26, adjust=False).mean()
+    macd_signal = macd.ewm(span=9, adjust=False).mean()
+    timestamp = pd.Timestamp(close.index[-1])
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    updated = timestamp.tz_convert("UTC").isoformat()
+    age = max(0, (datetime.now(timezone.utc)-datetime.fromisoformat(updated)).total_seconds())
+    rv = float(rsi.iloc[-1])
+    signal = "WAIT"
+    if pd.notna(rv):
+        if ema9.iloc[-1] > ema21.iloc[-1] and macd.iloc[-1] > macd_signal.iloc[-1] and 50 < rv < 70:
+            signal = "BUY"
+        elif ema9.iloc[-1] < ema21.iloc[-1] and macd.iloc[-1] < macd_signal.iloc[-1] and 30 < rv < 50:
+            signal = "SELL"
+    return {"symbol": symbol, "price": float(close.iloc[-1]), "signal": signal,
+            "rsi": round(rv, 2) if pd.notna(rv) else None, "ema9": float(ema9.iloc[-1]),
+            "ema21": float(ema21.iloc[-1]), "macd": float(macd.iloc[-1]),
+            "updated": updated, "data_age_seconds": age, "spread_rate": config.assumed_spread_rate,
+            "spread_source": "configured paper estimate (yfinance does not provide bid/ask)"}
+
+
 def analyze_market(symbol, ticker):
+    return market_data_cache.get(symbol, lambda: _analyze_market_uncached(symbol, ticker))
+
+
+def market_data_age_seconds(market, now=None):
+    """Calculate age from the source candle timestamp, never a stored age snapshot."""
+    updated = market.get("updated")
+    if not updated:
+        return None
     try:
-        df = yf.download(ticker, period="5d", interval="1m", progress=False, auto_adjust=True, threads=False)
-        if df.empty:
-            return {"symbol": symbol, "signal": "WAIT", "error": "No market data", "updated": None}
-        close = df["Close"]
-        if isinstance(close, pd.DataFrame):
-            close = close.iloc[:, 0]
-        close = close.dropna()
-        if len(close) < 35:
-            return {"symbol": symbol, "signal": "WAIT", "error": "Not enough candles", "updated": None}
-        ema9, ema21 = close.ewm(span=9, adjust=False).mean(), close.ewm(span=21, adjust=False).mean()
-        rsi = calculate_rsi(close)
-        macd = close.ewm(span=12, adjust=False).mean()-close.ewm(span=26, adjust=False).mean()
-        macd_signal = macd.ewm(span=9, adjust=False).mean()
-        timestamp = pd.Timestamp(close.index[-1])
+        if isinstance(updated, datetime):
+            timestamp = updated
+        else:
+            timestamp = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
         if timestamp.tzinfo is None:
-            timestamp = timestamp.tz_localize("UTC")
-        updated = timestamp.tz_convert("UTC").isoformat()
-        age = max(0, (datetime.now(timezone.utc)-datetime.fromisoformat(updated)).total_seconds())
-        rv = float(rsi.iloc[-1])
-        signal = "WAIT"
-        if pd.notna(rv):
-            if ema9.iloc[-1] > ema21.iloc[-1] and macd.iloc[-1] > macd_signal.iloc[-1] and 50 < rv < 70:
-                signal = "BUY"
-            elif ema9.iloc[-1] < ema21.iloc[-1] and macd.iloc[-1] < macd_signal.iloc[-1] and 30 < rv < 50:
-                signal = "SELL"
-        return {"symbol": symbol, "price": float(close.iloc[-1]), "signal": signal,
-                "rsi": round(rv, 2) if pd.notna(rv) else None, "ema9": float(ema9.iloc[-1]),
-                "ema21": float(ema21.iloc[-1]), "macd": float(macd.iloc[-1]),
-                "updated": updated, "data_age_seconds": age, "spread_rate": config.assumed_spread_rate,
-                "spread_source": "configured paper estimate (yfinance does not provide bid/ask)"}
-    except Exception as exc:
-        return {"symbol": symbol, "signal": "WAIT", "error": str(exc), "updated": None}
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        age = (current.astimezone(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
+        return age if age >= 0 else None
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
 
 
-def fresh_market_quote(market):
-    """Return a normalized quote only when both price and timestamp are trustworthy."""
-    if market.get("error"):
+def current_market_snapshot(market, now=None):
+    """Copy a market result with age/status recalculated for the current request."""
+    snapshot = dict(market)
+    age = market_data_age_seconds(snapshot, now)
+    snapshot["data_age_seconds"] = age
+    if age is None:
+        if snapshot.get("updated"):
+            snapshot["data_status"] = "invalid"
+            snapshot["error"] = "Market data timestamp is invalid or in the future"
+        else:
+            snapshot["data_status"] = snapshot.get("data_status") or "unavailable"
+        return snapshot
+    if age > config.max_data_age_seconds:
+        snapshot["data_status"] = "stale"
+        snapshot["error"] = "Stale cached market data"
+    else:
+        snapshot["data_status"] = "fresh"
+        if snapshot.get("error") in ("Stale cached market data",
+                                      "Market data timestamp is invalid or in the future",
+                                      "Market data timestamp is in the future"):
+            snapshot["error"] = None
+    return snapshot
+
+
+def fresh_market_quote(market, now=None):
+    """Return a quote only when its source candle is fresh at this exact check."""
+    if market.get("error") and market.get("error") != "Stale cached market data":
         return None
     try:
         price = float(market.get("price"))
-        age = float(market.get("data_age_seconds"))
     except (TypeError, ValueError):
+        return None
+    age = market_data_age_seconds(market, now)
+    if age is None:
         return None
     if not math.isfinite(price) or price <= 0 or not math.isfinite(age) or age < 0:
         return None
@@ -112,37 +170,52 @@ def fresh_market_quote(market):
 
 
 def process_market_cycle():
-    results = {s: analyze_market(s, ticker) for s, ticker in SYMBOLS.items()}
+    raw_results = {s: analyze_market(s, ticker) for s, ticker in SYMBOLS.items()}
+    cycle_now = datetime.now(timezone.utc)
+    results = {symbol: current_market_snapshot(market, cycle_now)
+               for symbol, market in raw_results.items()}
     fresh_quotes = {symbol: quote for symbol, market in results.items()
                     if (quote := fresh_market_quote(market)) is not None}
     fresh_prices = {symbol: quote[0] for symbol, quote in fresh_quotes.items()}
-    stale_symbols = [symbol for symbol in results if symbol not in fresh_quotes]
     with market_lock:
         markets.clear()
         markets.update(results)
     engine.set_prices(fresh_prices)
-    engine.check_exits(fresh_prices)
+    exit_prices = {symbol: quote[0] for symbol, market in results.items()
+                   if (quote := fresh_market_quote(market)) is not None}
+    engine.check_exits(exit_prices)
+    stale_symbols = [symbol for symbol, market in results.items()
+                     if fresh_market_quote(market) is None]
+    warning_parts = []
+    fetch_error_symbols = [symbol for symbol, market in results.items() if market.get("fetch_error")]
+    if fetch_error_symbols:
+        warning_parts.append(f"Yahoo Finance fetch error for {', '.join(fetch_error_symbols)}; cached quotes usable only while fresh")
     if stale_symbols:
         affected_positions = sorted(set(stale_symbols).intersection(engine.positions))
-        warning = (f"Stale or unavailable market data for {', '.join(stale_symbols)}; "
-                   "new entries and automatic exits blocked for affected instruments")
+        warning_parts.append(f"Stale or unavailable market data for {', '.join(stale_symbols)}; "
+                             "new entries and automatic exits blocked for affected instruments")
         if affected_positions:
-            warning += f"; open positions require attention: {', '.join(affected_positions)}"
-        engine.set_market_warning(warning)
+            warning_parts.append(f"open positions require attention: {', '.join(affected_positions)}")
+    known_signal_ids = {item.get("signal_id") for item in engine.state.get("signals", [])}
     for symbol, market in results.items():
-        if symbol not in fresh_quotes:
-            continue
         if market.get("signal") not in ("BUY", "SELL"):
             continue
+        quote = fresh_market_quote(market)
+        if quote is None:
+            continue
         signal_id = hashlib.sha256(f"{symbol}|{market['updated']}|{market['signal']}".encode()).hexdigest()
+        if signal_id in known_signal_ids:
+            continue
         signal = {**market, "signal_id": signal_id, "created_at": utc_now()}
         engine.record_signal(signal)
-        price, age = fresh_quotes[symbol]
+        known_signal_ids.add(signal_id)
+        quote = fresh_market_quote(market)
+        if quote is None:
+            continue
+        price, age = quote
         engine.open_position(symbol, market["signal"], price, signal_id=signal_id,
                              spread_rate=market.get("spread_rate"), data_age_seconds=age)
-    if stale_symbols:
-        return
-    engine.set_market_warning(None)
+    engine.set_market_warning("; ".join(warning_parts) if warning_parts else None)
 
 
 def market_monitor():
@@ -176,7 +249,7 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 async function load(){try{const r=await fetch('/status');const d=await r.json();const money=n=>Number(n||0).toFixed(2)+' '+(d.currency||'EUR');
 document.getElementById('summary').innerHTML=[['Stanje',money(d.balance)],['Vrednost računa',money(d.equity)],['Realizovani P/L',money(d.realized_pnl)],['Nerealizovani P/L',money(d.unrealized_pnl)],['Režim',d.mode],['Emergency STOP',d.risk?.emergency_stop?'AKTIVAN':'isključen']].map(x=>'<div class="card"><div class="muted">'+esc(x[0])+'</div><div class="value">'+esc(x[1])+'</div></div>').join('');
 document.getElementById('warning').textContent=d.risk?.market_warning||d.risk?.pause_reason||'';
-document.getElementById('markets').innerHTML=Object.values(d.markets).map(m=>'<p><b>'+esc(m.symbol)+'</b> · '+esc(m.price??'—')+' · <b class="'+(m.signal==='BUY'?'buy':m.signal==='SELL'?'sell':'')+'">'+esc(m.signal)+'</b> · RSI '+esc(m.rsi??'—')+(m.error?' · '+esc(m.error):'')+(m.data_age_seconds!=null?' · starost '+Math.round(m.data_age_seconds)+'s':'')+'</p>').join('')||'Nema podataka';
+document.getElementById('markets').innerHTML=Object.values(d.markets).map(m=>'<p><b>'+esc(m.symbol)+'</b> · '+esc(m.price??'—')+' · <b class="'+(m.signal==='BUY'?'buy':m.signal==='SELL'?'sell':'')+'">'+esc(m.signal)+'</b> · RSI '+esc(m.rsi??'—')+(m.data_age_seconds!=null?' · starost cene '+Math.round(m.data_age_seconds)+'s':' · starost cene nepoznata')+(m.error?' · '+esc(m.error):'')+(m.fetch_error?' · poslednja greška: '+esc(m.fetch_error):'')+(m.retry_after_seconds>0?' · sledeći pokušaj za '+Math.ceil(m.retry_after_seconds)+'s':'')+(m.last_success_at?' · poslednji uspeh '+esc(m.last_success_at):'')+'</p>').join('')||'Nema podataka';
 document.getElementById('positions').innerHTML=Object.values(d.positions).map(p=>'<p><b>'+esc(p.symbol)+' '+esc(p.side)+'</b> · ulaz '+esc(p.entry_price)+' · količina '+esc(p.quantity)+'<br>Stop Loss: '+esc(p.stop_loss)+' · Take Profit: '+esc(p.take_profit)+'</p>').join('')||'Nema otvorenih pozicija';
 document.getElementById('trades').innerHTML=d.trades.length?'<table><tr><th>Instrument</th><th>Strana</th><th>P/L</th><th>Razlog</th></tr>'+d.trades.slice(0,15).map(t=>'<tr><td>'+esc(t.symbol)+'</td><td>'+esc(t.side)+'</td><td>'+money(t.pnl)+'</td><td>'+esc(t.reason)+'</td></tr>').join('')+'</table>':'Još nema zatvorenih trgovina';document.getElementById('updated').textContent='Poslednje ažuriranje: '+(d.last_update||'čeka se')+' · Status: '+d.status;
 }catch(e){document.getElementById('updated').textContent='Greška pri učitavanju: '+e}}load();setInterval(load,15000);
@@ -191,23 +264,28 @@ def dashboard():
 
 @app.route("/status")
 def status():
+    now = datetime.now(timezone.utc)
     with market_lock:
-        current = {k: dict(v) for k, v in markets.items()}
+        current = {k: current_market_snapshot(v, now) for k, v in markets.items()}
     prices = {symbol: quote[0] for symbol, market in current.items()
-              if (quote := fresh_market_quote(market)) is not None}
+              if (quote := fresh_market_quote(market, now)) is not None}
     data = engine.snapshot(prices)
     data.update({"name": "AI Trading Bot V3", "mode": "PAPER TRADING ONLY", "status": "RUNNING" if monitor_started else "STARTING",
                  "starting_capital": engine.state["starting_balance"], "markets": current,
                  "currency": PAPER_CURRENCY,
                  "positions": data["positions"], "last_update": max((m.get("updated") or "" for m in current.values()), default=None),
-                 "last_error": next((m["error"] for m in current.values() if m.get("error")), None)})
+                 "last_error": next((m.get("fetch_error") or m.get("error") for m in current.values()
+                                     if m.get("fetch_error") or m.get("error")), None)})
     return jsonify(data)
 
 
 @app.route("/signals")
 def signals():
+    now = datetime.now(timezone.utc)
     with market_lock:
-        return jsonify(markets.copy())
+        current = {symbol: current_market_snapshot(market, now)
+                   for symbol, market in markets.items()}
+    return jsonify(current)
 
 
 @app.route("/positions")
@@ -223,9 +301,10 @@ def trades():
 @app.route("/health")
 def health():
     risk = engine.risk_status()
+    now = datetime.now(timezone.utc)
     with market_lock:
-        current = list(markets.values())
-    has_fresh_market = any(fresh_market_quote(market) is not None for market in current)
+        current = [current_market_snapshot(market, now) for market in markets.values()]
+    has_fresh_market = any(fresh_market_quote(market, now) is not None for market in current)
     status = "starting" if not monitor_started else "degraded" if risk.get("market_warning") or not has_fresh_market else "healthy"
     return jsonify({"status": status, "mode": "PAPER_ONLY", "risk": risk})
 
@@ -264,8 +343,10 @@ def manual_paper_order():
     if not require_paper_token():
         return jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"}), 401
     body = request.get_json(silent=True) or {}
-    market = markets.get(body.get("symbol"), {})
-    quote = fresh_market_quote(market)
+    now = datetime.now(timezone.utc)
+    with market_lock:
+        market = current_market_snapshot(markets.get(body.get("symbol"), {}), now)
+    quote = fresh_market_quote(market, now)
     if quote is None:
         return jsonify({"ok": False, "reason": "STALE_MARKET_DATA"}), 409
     result = engine.open_position(body.get("symbol"), body.get("side"), quote[0],
@@ -278,8 +359,10 @@ def manual_paper_order():
 def close_paper_position(symbol):
     if not require_paper_token():
         return jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"}), 401
-    market = markets.get(symbol, {})
-    quote = fresh_market_quote(market)
+    now = datetime.now(timezone.utc)
+    with market_lock:
+        market = current_market_snapshot(markets.get(symbol, {}), now)
+    quote = fresh_market_quote(market, now)
     if quote is None:
         return jsonify({"ok": False, "reason": "STALE_MARKET_DATA"}), 409
     result = engine.close_position(symbol, quote[0], "MANUAL")

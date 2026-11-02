@@ -1,4 +1,5 @@
 import importlib
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import pytest
+from yfinance.exceptions import YFRateLimitError
 
 from database import PaperStore
 from risk_engine import PaperRiskEngine, RiskConfig
@@ -28,7 +30,7 @@ def service(tmp_path, monkeypatch):
     main.markets.clear()
     main.markets.update({
         "US100": {"symbol": "US100", "signal": "WAIT", "price": 20000.0,
-                  "updated": "2026-11-01T12:00:00+00:00", "data_age_seconds": 1,
+                  "updated": main.utc_now(), "data_age_seconds": 1,
                   "spread_rate": 0.0002}
     })
     return main, main.app.test_client()
@@ -38,6 +40,10 @@ def test_read_only_http_routes_and_dashboard(service):
     main, client = service
     assert client.get("/").status_code == 200
     assert b"PAPER TRADING ONLY" in client.get("/dashboard").data
+    dashboard = client.get("/dashboard").data
+    assert "poslednja greška".encode() in dashboard
+    assert "sledeći pokušaj za".encode() in dashboard
+    assert "starost cene".encode() in dashboard
     assert client.get("/health").json["mode"] == "PAPER_ONLY"
     status = client.get("/status")
     assert status.status_code == 200
@@ -47,6 +53,37 @@ def test_read_only_http_routes_and_dashboard(service):
     assert client.get("/signals").json["US100"]["signal"] == "WAIT"
     assert client.get("/positions").json == {}
     assert client.get("/trades").json == []
+
+
+def test_yfinance_history_rate_limit_reaches_provider_backoff(service, monkeypatch):
+    main, _ = service
+    calls = []
+
+    class FakeTicker:
+        def history(self, **kwargs):
+            calls.append(kwargs)
+            raise YFRateLimitError()
+
+    monkeypatch.setattr(main.yf, "Ticker", lambda ticker: FakeTicker())
+    result = main.analyze_market("US100", "^NDX")
+
+    assert calls == [{"period": "5d", "interval": "1m", "actions": False,
+                      "auto_adjust": True, "timeout": 10}]
+    assert "Yahoo Finance HTTP 429" in result["fetch_error"]
+    assert result["retry_after_seconds"] > 0
+
+
+def test_market_data_timing_defaults_remain_aligned(service, monkeypatch):
+    main, _ = service
+    monkeypatch.setenv("REFRESH_SECONDS", "60")
+    monkeypatch.setenv("YF_MIN_FETCH_INTERVAL_SECONDS", "60")
+    monkeypatch.setenv("MAX_DATA_AGE_SECONDS", "180")
+    main = importlib.reload(main)
+    monkeypatch.setattr(main, "start_monitor", lambda: None)
+
+    assert main.REFRESH_SECONDS == 60
+    assert main.market_data_cache.min_fetch_interval_seconds == 60
+    assert main.config.max_data_age_seconds == 180
 
 
 def test_paper_currency_can_be_configured_explicitly(service, monkeypatch):
@@ -63,8 +100,49 @@ def test_health_is_degraded_without_fresh_market_data(service):
     main.markets.clear()
     assert client.get("/health").json["status"] == "degraded"
     main.markets["US100"] = {"symbol": "US100", "price": 20000, "signal": "WAIT",
-                             "data_age_seconds": 1, "error": None}
+                             "updated": main.utc_now(), "data_age_seconds": 1, "error": None}
     assert client.get("/health").json["status"] == "healthy"
+
+
+def test_quote_freshness_uses_candle_timestamp_not_saved_age(service):
+    main, _ = service
+    now = datetime(2026, 11, 2, 14, 0, tzinfo=timezone.utc)
+    recent = {"price": 100, "updated": (now - timedelta(seconds=179)).isoformat(),
+              "data_age_seconds": 10_000}
+    expired = {"price": 100, "updated": (now - timedelta(seconds=181)).isoformat(),
+               "data_age_seconds": 1}
+
+    assert main.fresh_market_quote(recent, now) == (100.0, 179.0)
+    assert main.fresh_market_quote(expired, now) is None
+
+
+def test_manual_entry_and_close_reject_stale_snapshots(service):
+    main, client = service
+    auth = {"Authorization": "Bearer integration-test-token-with-at-least-32-characters"}
+    stale_timestamp = (datetime.now(timezone.utc) - timedelta(seconds=181)).isoformat()
+    stale_snapshot = {"signal": "WAIT", "price": 19_900.0, "updated": stale_timestamp,
+                      "data_age_seconds": 1, "data_status": "fresh", "spread_rate": 0.0002}
+    main.markets["US100"] = {"symbol": "US100", **stale_snapshot}
+    main.markets["US500"] = {"symbol": "US500", **stale_snapshot}
+    status = client.get("/status").json
+    signals = client.get("/signals").json
+    assert status["markets"]["US100"]["data_age_seconds"] > main.config.max_data_age_seconds
+    assert signals["US500"]["data_age_seconds"] > main.config.max_data_age_seconds
+    opened = main.engine.open_position("US100", "BUY", 20_000,
+                                       signal_id="stale-manual-close",
+                                       spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+
+    entry = client.post("/paper/orders", json={"symbol": "US500", "side": "BUY",
+                                                "signal_id": "stale-manual-entry"}, headers=auth)
+    close = client.post("/paper/positions/US100/close", headers=auth)
+
+    assert entry.status_code == 409
+    assert entry.json["reason"] == "STALE_MARKET_DATA"
+    assert close.status_code == 409
+    assert close.json["reason"] == "STALE_MARKET_DATA"
+    assert "US100" in main.engine.positions
+    assert main.engine.state["trades"] == []
 
 
 @pytest.mark.parametrize("path,payload", [
@@ -103,7 +181,7 @@ def test_stale_or_missing_market_data_blocks_new_positions(service, monkeypatch)
     main, _ = service
     monkeypatch.setattr(main, "analyze_market", lambda symbol, ticker: {
         "symbol": symbol, "price": 20000, "signal": "BUY", "updated": "2026-11-01T12:00:00+00:00",
-        "data_age_seconds": 10_000, "spread_rate": 0.0001,
+        "data_age_seconds": 1, "spread_rate": 0.0001,
     })
     main.process_market_cycle()
     assert main.engine.positions == {}
@@ -125,7 +203,7 @@ def test_stale_market_data_does_not_block_fresh_instrument(service, monkeypatch)
                     "updated": "2026-11-01T12:00:00+00:00", "data_age_seconds": 10_000,
                     "spread_rate": 0.0002}
         return {"symbol": symbol, "price": 5000, "signal": "BUY",
-                "updated": "2026-11-01T12:00:00+00:00", "data_age_seconds": 1,
+                "updated": main.utc_now(), "data_age_seconds": 1,
                 "spread_rate": 0.0002}
 
     monkeypatch.setattr(main, "analyze_market", fake_market)
@@ -149,10 +227,10 @@ def test_stale_price_crossing_stop_loss_does_not_close_position(service, monkeyp
     def fake_market(symbol, ticker):
         if symbol == "US100":
             return {"symbol": symbol, "price": stop_loss - 100, "signal": "WAIT",
-                    "updated": "2026-11-01T12:00:00+00:00", "data_age_seconds": 10_000,
+                    "updated": "2026-11-01T12:00:00+00:00", "data_age_seconds": 1,
                     "spread_rate": 0.0002}
         return {"symbol": symbol, "price": 5000, "signal": "WAIT",
-                "updated": "2026-11-01T12:00:00+00:00", "data_age_seconds": 1,
+                "updated": main.utc_now(), "data_age_seconds": 1,
                 "spread_rate": 0.0002}
 
     monkeypatch.setattr(main, "analyze_market", fake_market)
@@ -171,9 +249,10 @@ def test_fresh_price_crossing_stop_loss_still_closes_position(service, monkeypat
                                         spread_rate=0.0002, data_age_seconds=1)
     assert opened["ok"]
     stop_loss = opened["position"]["stop_loss"]
+    fresh_timestamp = main.utc_now()
     monkeypatch.setattr(main, "analyze_market", lambda symbol, ticker: {
         "symbol": symbol, "price": stop_loss - 100 if symbol == "US100" else 5000,
-        "signal": "WAIT", "updated": "2026-11-01T12:00:00+00:00",
+        "signal": "WAIT", "updated": fresh_timestamp,
         "data_age_seconds": 1, "spread_rate": 0.0002,
     })
 
@@ -181,6 +260,54 @@ def test_fresh_price_crossing_stop_loss_still_closes_position(service, monkeypat
 
     assert "US100" not in main.engine.positions
     assert main.engine.state["trades"][0]["reason"] == "STOP_LOSS"
+
+
+def test_stale_cached_price_below_stop_loss_never_closes_position(service, monkeypatch):
+    main, _ = service
+    opened = main.engine.open_position("US100", "BUY", 20000, signal_id="cache-stale-exit",
+                                        spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+    stale_trigger = opened["position"]["stop_loss"] - 100
+    stale_timestamp = (datetime.now(timezone.utc) - timedelta(seconds=10_000)).isoformat()
+    fresh_timestamp = datetime.now(timezone.utc).isoformat()
+
+    def fake_analysis(symbol, ticker):
+        if symbol == "US100":
+            return {"symbol": symbol, "price": stale_trigger, "signal": "WAIT",
+                    "updated": stale_timestamp, "data_age_seconds": 10_000,
+                    "spread_rate": 0.0002}
+        return {"symbol": symbol, "price": 5000, "signal": "WAIT",
+                "updated": fresh_timestamp, "data_age_seconds": 1,
+                "spread_rate": 0.0002}
+
+    monkeypatch.setattr(main, "_analyze_market_uncached", fake_analysis)
+    main.process_market_cycle()
+
+    assert "US100" in main.engine.positions
+    assert main.engine.state["trades"] == []
+    assert main.markets["US100"]["data_status"] == "stale"
+    assert main.markets["US100"]["data_age_seconds"] > main.config.max_data_age_seconds
+
+
+def test_same_cached_candle_does_not_record_or_open_duplicate_signal(service, monkeypatch):
+    main, _ = service
+    candle_timestamp = main.utc_now()
+    monkeypatch.setattr(main, "analyze_market", lambda symbol, ticker: {
+        "symbol": symbol, "price": 20000 if symbol == "US100" else 5000,
+        "signal": "BUY" if symbol == "US100" else "WAIT",
+        "updated": candle_timestamp, "data_age_seconds": 1,
+        "spread_rate": 0.0002,
+    })
+
+    main.process_market_cycle()
+    assert "US100" in main.engine.positions
+    assert len(main.engine.state["signals"]) == 1
+    main.engine.close_position("US100", 20000, "MANUAL")
+
+    main.process_market_cycle()
+
+    assert main.engine.positions == {}
+    assert len(main.engine.state["signals"]) == 1
 
 
 def _free_port():
@@ -208,8 +335,9 @@ def test_local_server_dashboard_and_full_process_restart(tmp_path):
     runner = tmp_path / "run_paper_app.py"
     runner.write_text("""
 import main
+from datetime import datetime, timezone
 main.start_monitor = lambda: None
-main.markets['US100'] = {'symbol':'US100','signal':'WAIT','price':20000.0,'updated':'2026-11-01T12:00:00+00:00','data_age_seconds':1,'spread_rate':0.0002}
+main.markets['US100'] = {'symbol':'US100','signal':'WAIT','price':20000.0,'updated':datetime.now(timezone.utc).isoformat(),'data_age_seconds':1,'spread_rate':0.0002}
 main.app.run(host='127.0.0.1', port=int(__import__('os').environ['PORT']), use_reloader=False)
 """, encoding="utf-8")
     port = _free_port()
