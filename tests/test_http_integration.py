@@ -221,7 +221,7 @@ def test_stale_price_crossing_stop_loss_does_not_close_position(service, monkeyp
     opened = main.engine.open_position("US100", "BUY", 20000, signal_id="stale-exit",
                                         spread_rate=0.0002, data_age_seconds=1)
     assert opened["ok"]
-    main.engine.set_prices({"US100": 20000})
+    main.engine.set_prices({"US100": 20000}, timestamps={"US100": main.utc_now()})
     stop_loss = opened["position"]["stop_loss"]
 
     def fake_market(symbol, ticker):
@@ -241,6 +241,89 @@ def test_stale_price_crossing_stop_loss_does_not_close_position(service, monkeyp
     warning = main.engine.risk_status()["market_warning"]
     assert "US100" in warning
     assert "open positions require attention" in warning
+
+
+def test_status_and_dashboard_mark_open_position_value_unconfirmed(service):
+    main, client = service
+    opened = main.engine.open_position("US100", "BUY", 20000, signal_id="unconfirmed-equity",
+                                        spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+    fresh_timestamp = main.utc_now()
+    main.engine.set_prices({"US100": 20000}, timestamps={"US100": fresh_timestamp})
+    stale_timestamp = (datetime.now(timezone.utc) - timedelta(seconds=181)).isoformat()
+    main.engine.state["last_price_timestamps"]["US100"] = stale_timestamp
+    main.markets["US100"] = {"symbol": "US100", "price": 20000, "signal": "WAIT",
+                             "updated": stale_timestamp, "data_age_seconds": 1,
+                             "data_status": "fresh", "spread_rate": 0.0002}
+
+    status = client.get("/status").json
+    dashboard = client.get("/dashboard").get_data(as_text=True)
+
+    assert status["equity"] is None
+    assert status["risk"]["equity_status"] == "UNCONFIRMED"
+    assert status["risk"]["new_entries_blocked"] is True
+    assert status["risk"]["entry_block_reason"] == "RISK_UNAVAILABLE"
+    assert status["risk"]["daily_loss_used"] is None
+    assert "US100" in status["risk"]["unpriced_positions"]
+    assert status["positions"]["US100"]["current_price"] is None
+    assert status["positions"]["US100"]["unrealized_pnl"] is None
+    assert status["positions"]["US100"]["valuation_status"] == "UNCONFIRMED"
+    assert status["risk"]["valuation_warning"]
+    assert "Privremeno nedostupno" in dashboard
+    assert "nepotvrđena" in dashboard
+    main.monitor_started = True
+    assert client.get("/health").json["status"] == "degraded"
+
+
+def test_signal_state_storage_warning_is_visible_in_status_and_dashboard(service):
+    main, client = service
+    signal = {"signal_id": "orphan-http-signal", "symbol": "US100", "signal": "BUY",
+              "created_at": main.utc_now()}
+    with main.engine.store._connect() as conn:
+        conn.execute("INSERT INTO signals(signal_id,symbol,payload,created_at) VALUES(?,?,?,?)",
+                     (signal["signal_id"], signal["symbol"], json.dumps(signal), signal["created_at"]))
+
+    assert not main.engine.record_signal(signal)
+    response = client.get("/status").json["risk"]
+    dashboard = client.get("/dashboard").get_data(as_text=True)
+
+    assert response["storage_failed"] is True
+    assert response["pause_reason"] == "SIGNAL_STATE_INCONSISTENT"
+    assert "Neusaglašen signal" in response["storage_warning"]
+    assert "storage_warning" in dashboard
+    main.monitor_started = True
+    assert client.get("/health").json["status"] == "degraded"
+
+
+def test_stale_market_route_does_not_expose_last_price_as_current(service):
+    main, client = service
+    stale_timestamp = (datetime.now(timezone.utc) - timedelta(seconds=181)).isoformat()
+    main.markets["US100"] = {"symbol": "US100", "price": 123.45, "signal": "BUY",
+                             "updated": stale_timestamp, "data_age_seconds": 1,
+                             "data_status": "fresh", "spread_rate": 0.0002}
+
+    market = client.get("/signals").json["US100"]
+    dashboard = client.get("/dashboard").get_data(as_text=True)
+
+    assert market["data_status"] == "stale"
+    assert market["price"] is None
+    assert market["last_known_price"] == 123.45
+    assert market["data_age_seconds"] > main.config.max_data_age_seconds
+    assert "poslednja poznata: " in dashboard
+
+
+def test_missing_market_timestamp_overrides_existing_fresh_status(service):
+    main, client = service
+    main.markets["US100"] = {"symbol": "US100", "price": 123.45, "signal": "BUY",
+                             "updated": None, "data_age_seconds": 1,
+                             "data_status": "fresh", "spread_rate": 0.0002}
+
+    market = client.get("/signals").json["US100"]
+
+    assert market["data_status"] == "unavailable"
+    assert market["data_age_seconds"] is None
+    assert market["price"] is None
+    assert market["last_known_price"] == 123.45
 
 
 def test_fresh_price_crossing_stop_loss_still_closes_position(service, monkeypatch):
@@ -308,6 +391,215 @@ def test_same_cached_candle_does_not_record_or_open_duplicate_signal(service, mo
 
     assert main.engine.positions == {}
     assert len(main.engine.state["signals"]) == 1
+
+
+def _install_us100_signal(main, monkeypatch, signal, *, price=20000.0, timestamp=None):
+    timestamp = timestamp or main.utc_now()
+
+    def fake_analysis(symbol, ticker):
+        return {"symbol": symbol, "price": price if symbol == "US100" else 5000.0,
+                "signal": signal if symbol == "US100" else "WAIT",
+                "updated": timestamp, "data_age_seconds": 1,
+                "spread_rate": 0.0002}
+
+    monkeypatch.setattr(main, "analyze_market", fake_analysis)
+    return timestamp
+
+
+def test_reverse_sell_signal_closes_buy_position_with_paper_costs(service, monkeypatch):
+    main, _ = service
+    opened = main.engine.open_position("US100", "BUY", 20000, signal_id="reverse-buy-open",
+                                        spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+
+    def fail_if_separate_signal_write(*args, **kwargs):
+        raise OSError("separate signal update must not run after a close")
+
+    monkeypatch.setattr(main.engine.store, "persist_signal_update", fail_if_separate_signal_write)
+    _install_us100_signal(main, monkeypatch, "SELL", price=20020)
+
+    main.process_market_cycle()
+    main.process_market_cycle()
+
+    assert main.engine.positions == {}
+    assert main.engine.storage_failed is False
+    trade = main.engine.state["trades"][0]
+    assert trade["side"] == "BUY"
+    assert trade["reason"] == "REVERSE_SIGNAL"
+    assert trade["fees"] > 0
+    assert trade["exit_price"] != 20020
+    assert main.engine.state["signals"][0]["execution_reason"] == "REVERSE_SIGNAL"
+    assert main.engine.store.get_signals()[0]["execution_reason"] == "REVERSE_SIGNAL"
+    with main.engine.store._connect() as conn:
+        persisted_trades = conn.execute("SELECT payload FROM trades").fetchall()
+    assert len(persisted_trades) == 1
+
+
+def test_reverse_buy_signal_closes_sell_position(service, monkeypatch):
+    main, _ = service
+    opened = main.engine.open_position("US100", "SELL", 20000, signal_id="reverse-sell-open",
+                                        spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+    _install_us100_signal(main, monkeypatch, "BUY", price=20000)
+
+    main.process_market_cycle()
+
+    assert main.engine.positions == {}
+    assert main.engine.state["trades"][0]["side"] == "SELL"
+    assert main.engine.state["trades"][0]["reason"] == "REVERSE_SIGNAL"
+
+
+def test_reverse_exit_does_not_open_opposite_position_in_same_cycle(service, monkeypatch):
+    main, _ = service
+    assert main.engine.open_position("US100", "BUY", 20000, signal_id="reverse-no-reopen",
+                                     spread_rate=0.0002, data_age_seconds=1)["ok"]
+    _install_us100_signal(main, monkeypatch, "SELL", price=20020)
+
+    main.process_market_cycle()
+
+    assert "US100" not in main.engine.positions
+    assert len(main.engine.state["trades"]) == 1
+    assert main.engine.state["trades"][0]["reason"] == "REVERSE_SIGNAL"
+
+
+def test_stale_reverse_signal_does_not_close_position(service, monkeypatch):
+    main, _ = service
+    opened = main.engine.open_position("US100", "BUY", 20000, signal_id="reverse-stale",
+                                        spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+    stale_timestamp = (datetime.now(timezone.utc) - timedelta(
+        seconds=main.config.max_data_age_seconds + 1)).isoformat()
+    _install_us100_signal(main, monkeypatch, "SELL", price=20020, timestamp=stale_timestamp)
+
+    main.process_market_cycle()
+
+    assert "US100" in main.engine.positions
+    assert main.engine.state["trades"] == []
+    assert main.engine.state["signals"] == []
+
+
+def test_invalid_reverse_signal_does_not_close_position(service, monkeypatch):
+    main, _ = service
+    opened = main.engine.open_position("US100", "BUY", 20000, signal_id="reverse-invalid",
+                                        spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+    _install_us100_signal(main, monkeypatch, "SHORT", price=20020)
+
+    main.process_market_cycle()
+
+    assert "US100" in main.engine.positions
+    assert main.engine.state["trades"] == []
+    assert main.engine.state["signals"] == []
+
+
+def test_same_reverse_signal_cannot_close_twice(service, monkeypatch):
+    main, _ = service
+    opened = main.engine.open_position("US100", "BUY", 20000, signal_id="reverse-duplicate",
+                                        spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+    _install_us100_signal(main, monkeypatch, "SELL", price=20020)
+
+    main.process_market_cycle()
+    main.process_market_cycle()
+
+    assert main.engine.positions == {}
+    assert len(main.engine.state["signals"]) == 1
+    assert len(main.engine.state["trades"]) == 1
+    assert main.engine.state["trades"][0]["reason"] == "REVERSE_SIGNAL"
+    assert main.markets["US100"]["execution_status"] == "CLOSED"
+    with main.engine.store._connect() as conn:
+        persisted_trade_count = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+    assert persisted_trade_count == 1
+
+
+def test_failed_reverse_close_preserves_position_and_records_failure(service, monkeypatch):
+    main, _ = service
+    opened = main.engine.open_position("US100", "BUY", 20000, signal_id="reverse-close-fails",
+                                        spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+
+    def fail_close(*args, **kwargs):
+        raise OSError("simulated paper database write failure")
+
+    monkeypatch.setattr(main.engine.store, "persist_closed_trade", fail_close)
+    _install_us100_signal(main, monkeypatch, "SELL", price=20020)
+
+    main.process_market_cycle()
+
+    assert main.engine.positions["US100"] == opened["position"]
+    assert main.engine.state["trades"] == []
+    assert main.markets["US100"]["execution_status"] == "FAILED"
+    assert main.markets["US100"]["execution_reason"] == "DATABASE_UNAVAILABLE"
+    assert main.engine.state["signals"][0]["execution_reason"] == "DATABASE_UNAVAILABLE"
+    assert main.engine.store.get_signals()[0]["execution_reason"] == "DATABASE_UNAVAILABLE"
+    assert "Reverse-signal close failed" in main.engine.risk_status()["market_warning"]
+    blocked_entry = main.engine.open_position("US500", "BUY", 5000,
+                                              signal_id="db-failure-blocks-entry",
+                                              spread_rate=0.0002, data_age_seconds=1)
+    assert blocked_entry == {"ok": False, "reason": "DATABASE_UNAVAILABLE"}
+
+    main.process_market_cycle()
+
+    assert main.markets["US100"]["execution_status"] == "FAILED"
+    assert main.markets["US100"]["execution_reason"] == "DATABASE_UNAVAILABLE"
+    assert "Reverse-signal close failed" in main.engine.risk_status()["market_warning"]
+
+
+def test_no_position_still_opens_on_fresh_signal(service, monkeypatch):
+    main, _ = service
+    _install_us100_signal(main, monkeypatch, "BUY", price=20000)
+
+    main.process_market_cycle()
+
+    assert "US100" in main.engine.positions
+
+
+def test_reverse_exit_keeps_emergency_stop_active_for_next_cycle(service, monkeypatch):
+    main, _ = service
+    opened = main.engine.open_position("US100", "BUY", 20000, signal_id="reverse-emergency-stop",
+                                        spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+    main.engine.emergency_stop()
+    _install_us100_signal(main, monkeypatch, "SELL", price=20020)
+
+    main.process_market_cycle()
+
+    assert main.engine.positions == {}
+    assert main.engine.state["trades"][0]["reason"] == "REVERSE_SIGNAL"
+    assert main.engine.risk_status()["emergency_stop"] is True
+
+    _install_us100_signal(main, monkeypatch, "SELL", price=20020)
+    main.process_market_cycle()
+
+    assert main.engine.positions == {}
+    assert main.markets["US100"]["execution_status"] == "REJECTED"
+    assert main.markets["US100"]["execution_reason"] == "EMERGENCY_STOP"
+
+
+def test_reverse_close_applies_daily_loss_limit_before_later_entry(service, monkeypatch):
+    main, _ = service
+    main.engine.config.risk_per_trade = 0.05
+    main.engine.config.max_daily_loss = 0.001
+    main.engine.config.max_total_risk = 0.5
+    main.engine.config.max_notional_multiple = 5
+    main.engine.config.stop_loss_pct = 0.10
+    main.engine.config.take_profit_pct = 0.20
+    opened = main.engine.open_position("US100", "BUY", 20000, signal_id="reverse-daily-loss",
+                                        spread_rate=0.0002, data_age_seconds=1)
+    assert opened["ok"]
+    _install_us100_signal(main, monkeypatch, "SELL", price=19000)
+
+    main.process_market_cycle()
+
+    assert main.engine.positions == {}
+    assert main.engine.state["trades"][0]["reason"] == "REVERSE_SIGNAL"
+    assert main.engine.risk_status()["pause_reason"] == "DAILY_LOSS_LIMIT"
+
+    _install_us100_signal(main, monkeypatch, "SELL", price=19000)
+    main.process_market_cycle()
+
+    assert main.engine.positions == {}
+    assert main.markets["US100"]["execution_reason"] == "DAILY_LOSS_LIMIT"
 
 
 def _free_port():

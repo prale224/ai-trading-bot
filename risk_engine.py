@@ -8,6 +8,8 @@ from copy import deepcopy
 import math
 import threading
 
+from database import SignalStateInconsistency
+
 
 @dataclass
 class RiskConfig:
@@ -52,6 +54,10 @@ class PaperRiskEngine:
             "day": self._today(), "day_start_equity": float(self.config.starting_balance),
             "daily_realized_pnl": 0.0, "last_market_warning": None, "last_prices": {},
         }
+        if not isinstance(self.state.get("last_prices"), dict):
+            self.state["last_prices"] = {}
+        if not isinstance(self.state.get("last_price_timestamps"), dict):
+            self.state["last_price_timestamps"] = {}
         self._roll_day()
         self._persist()
 
@@ -62,6 +68,100 @@ class PaperRiskEngine:
     @staticmethod
     def _now():
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _parse_market_timestamp(value):
+        if not value:
+            return None
+        try:
+            timestamp = value if isinstance(value, datetime) else datetime.fromisoformat(
+                str(value).replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            return timestamp.astimezone(timezone.utc)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _valid_price(value):
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return None
+        return price if math.isfinite(price) and price > 0 else None
+
+    def _fresh_price_marks(self, prices=None, timestamps=None, now=None):
+        """Return only marks whose source timestamps are still within the age limit."""
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        current = current.astimezone(timezone.utc)
+        marks = {}
+
+        def add_mark(symbol, value, observed_at):
+            price = self._valid_price(value)
+            timestamp = self._parse_market_timestamp(observed_at)
+            if price is None or timestamp is None:
+                return
+            age = (current - timestamp).total_seconds()
+            if not math.isfinite(age) or age < 0 or age > self.config.max_data_age_seconds:
+                return
+            marks[symbol] = {"price": price, "updated_at": timestamp.isoformat(),
+                             "age_seconds": age}
+
+        stored_prices = self.state.get("last_prices", {})
+        stored_timestamps = self.state.get("last_price_timestamps", {})
+        for symbol, price in stored_prices.items():
+            add_mark(symbol, price, stored_timestamps.get(symbol))
+
+        if prices:
+            supplied_timestamps = timestamps or {}
+            for symbol, price in prices.items():
+                observed_at = supplied_timestamps.get(symbol) if hasattr(supplied_timestamps, "get") else None
+                add_mark(symbol, price, observed_at)
+        return marks
+
+    def _position_valuation(self, prices=None, timestamps=None):
+        marks = self._fresh_price_marks(prices, timestamps)
+        known_unrealized = 0.0
+        unpriced = []
+        position_values = {}
+        for symbol, position in self.positions.items():
+            mark = marks.get(symbol)
+            if mark is None:
+                unpriced.append(symbol)
+                last_timestamp = self._parse_market_timestamp(
+                    self.state.get("last_price_timestamps", {}).get(symbol))
+                raw_last_age = ((datetime.now(timezone.utc) - last_timestamp).total_seconds()
+                                if last_timestamp else None)
+                last_age = raw_last_age if raw_last_age is not None and raw_last_age >= 0 else None
+                position_values[symbol] = {
+                    "current_price": None,
+                    "unrealized_pnl": None,
+                    "valuation_status": "UNCONFIRMED" if last_age is not None else "UNAVAILABLE",
+                    "price_updated_at": last_timestamp.isoformat() if last_timestamp else None,
+                    "price_age_seconds": last_age,
+                    "valuation_warning": "Sveža tržišna cena nije dostupna; trenutna vrednost pozicije nije potvrđena",
+                }
+                continue
+            direction = 1 if position["side"] == "BUY" else -1
+            unrealized = (mark["price"] - position["entry_price"]) * direction * position["quantity"]
+            known_unrealized += unrealized
+            position_values[symbol] = {
+                "current_price": mark["price"],
+                "unrealized_pnl": unrealized,
+                "valuation_status": "CONFIRMED",
+                "price_updated_at": mark["updated_at"],
+                "price_age_seconds": mark["age_seconds"],
+                "valuation_warning": None,
+            }
+        equity = self.balance + known_unrealized if not unpriced else None
+        unrealized_pnl = known_unrealized if not unpriced else None
+        warning = (f"Vrednost računa nije dostupna; potrebni su sveži tržišni podaci za: {', '.join(sorted(unpriced))}"
+                   if unpriced else None)
+        return {"equity": equity, "unrealized_pnl": unrealized_pnl,
+                "unpriced_positions": sorted(unpriced), "position_values": position_values,
+                "risk_calculation_available": not unpriced, "valuation_warning": warning}
 
     @property
     def balance(self):
@@ -78,58 +178,114 @@ class PaperRiskEngine:
             self._mark_storage_failure()
             raise
 
-    def _mark_storage_failure(self):
+    def _mark_storage_failure(self, reason="DATABASE_UNAVAILABLE", warning=None):
         self.storage_failed = True
-        self.state.update(paused=True, pause_reason="DATABASE_UNAVAILABLE", emergency_stop=True,
-                          last_market_warning="Database unavailable; PAPER trading is fail-closed")
+        warning = warning or "SQLite nije dostupan; PAPER ulasci su blokirani"
+        self.state.update(paused=True, pause_reason=reason, emergency_stop=True,
+                          last_market_warning=warning, storage_warning=warning)
 
     def _roll_day(self):
         today = self._today()
         if self.state["day"] != today:
+            current_equity = self.equity()
+            if current_equity is None:
+                return False
             self.state["day"] = today
-            self.state["day_start_equity"] = self.equity()
+            self.state["day_start_equity"] = current_equity
             self.state["daily_realized_pnl"] = 0.0
+            return True
+        return False
 
-    def equity(self, prices=None):
-        effective_prices = dict(self.state.get("last_prices", {}))
-        if prices:
-            for symbol, value in prices.items():
-                try:
-                    value = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if math.isfinite(value) and value > 0:
-                    effective_prices[symbol] = value
-        unrealized = sum((effective_prices.get(s, p["entry_price"])-p["entry_price"])
-                         * (1 if p["side"] == "BUY" else -1) * p["quantity"]
-                         for s, p in self.positions.items())
-        return self.balance + unrealized
+    def equity(self, prices=None, timestamps=None):
+        """Return confirmed equity, or None if any open position lacks a fresh mark."""
+        with self.lock:
+            return self._position_valuation(prices, timestamps)["equity"]
 
     def _daily_limit_hit(self):
         self._roll_day()
-        return self.equity() - self.state["day_start_equity"] <= -self.state["day_start_equity"] * self.config.max_daily_loss
+        current_equity = self.equity()
+        if current_equity is None:
+            return None
+        day_start_equity = self.state.get("day_start_equity")
+        if day_start_equity is None or day_start_equity <= 0:
+            return None
+        return current_equity - day_start_equity <= -day_start_equity * self.config.max_daily_loss
 
-    def risk_status(self, prices=None):
-        self._roll_day()
-        return {"paused": self.state["paused"], "pause_reason": self.state["pause_reason"],
-                "emergency_stop": self.state["emergency_stop"],
-                "daily_loss_limit": round(self.state["day_start_equity"]*self.config.max_daily_loss, 2),
-                "daily_loss_used": round(max(0, self.state["day_start_equity"]-self.equity(prices)), 2),
-                "open_positions": len(self.positions), "max_open_positions": self.config.max_open_positions,
-                "equity": round(self.equity(prices), 2),
-                "market_warning": self.state.get("last_market_warning")}
+    def risk_status(self, prices=None, timestamps=None):
+        with self.lock:
+            self._roll_day()
+            valuation = self._position_valuation(prices, timestamps)
+            equity = valuation["equity"]
+            day_start_equity = self.state.get("day_start_equity")
+            daily_loss_used = (max(0, day_start_equity - equity)
+                               if equity is not None and day_start_equity is not None else None)
+            entry_block_reason = (self.state["pause_reason"] if self.state["paused"]
+                                  else "EMERGENCY_STOP" if self.state["emergency_stop"]
+                                  else "RISK_UNAVAILABLE" if not valuation["risk_calculation_available"]
+                                  else None)
+            return {"paused": self.state["paused"], "pause_reason": self.state["pause_reason"],
+                    "emergency_stop": self.state["emergency_stop"],
+                    "new_entries_blocked": entry_block_reason is not None,
+                    "entry_block_reason": entry_block_reason,
+                    "daily_loss_limit": (round(day_start_equity*self.config.max_daily_loss, 2)
+                                         if day_start_equity is not None else None),
+                    "daily_loss_used": round(daily_loss_used, 2) if daily_loss_used is not None else None,
+                    "open_positions": len(self.positions), "max_open_positions": self.config.max_open_positions,
+                    "equity": round(equity, 2) if equity is not None else None,
+                    "equity_status": "CONFIRMED" if valuation["risk_calculation_available"] else "UNCONFIRMED",
+                    "risk_calculation_available": valuation["risk_calculation_available"],
+                    "unpriced_positions": valuation["unpriced_positions"],
+                    "valuation_warning": valuation["valuation_warning"],
+                    "storage_failed": self.storage_failed,
+                    "storage_warning": self.state.get("storage_warning") if self.storage_failed else None,
+                    "market_warning": self.state.get("last_market_warning")}
 
     def record_signal(self, signal):
         with self.lock:
+            signal_id = signal.get("signal_id")
+            if not signal_id or any(item.get("signal_id") == signal_id
+                                    for item in self.state.get("signals", [])):
+                return False
             previous = deepcopy(self.state)
             self.state["signals"].insert(0, dict(signal))
             self.state["signals"] = self.state["signals"][:1000]
             try:
-                self.store.record_signal(signal)
-                self._persist()
+                if not self.store.persist_signal(signal, self.state):
+                    self.state = previous
+                    return False
+            except SignalStateInconsistency as exc:
+                self.state = previous
+                self._mark_storage_failure(
+                    "SIGNAL_STATE_INCONSISTENT",
+                    f"Neusaglašen signal i bot state u SQLite bazi: {exc}; PAPER ulasci su blokirani")
+                return False
             except Exception:
                 self.state = previous
                 self._mark_storage_failure()
+                return False
+            return True
+
+    def update_signal_result(self, signal_id, result):
+        """Attach an execution outcome to a claimed, persisted signal."""
+        with self.lock:
+            signal = next((item for item in self.state.get("signals", [])
+                           if item.get("signal_id") == signal_id), None)
+            if signal is None:
+                return False
+            previous_signal = deepcopy(signal)
+            signal.update(dict(result))
+            try:
+                if not self.store.persist_signal_update(signal_id, signal, self.state):
+                    signal.clear()
+                    signal.update(previous_signal)
+                    self._mark_storage_failure()
+                    return False
+            except Exception:
+                signal.clear()
+                signal.update(previous_signal)
+                self._mark_storage_failure()
+                return False
+            return True
 
     def open_position(self, symbol, side, market_price, *, signal_id, spread_rate, data_age_seconds):
         with self.lock:
@@ -147,7 +303,10 @@ class PaperRiskEngine:
                 return {"ok": False, "reason": "STALE_MARKET_DATA"}
             if spread_rate is None or spread_rate > self.config.max_spread_rate:
                 return {"ok": False, "reason": "SPREAD_LIMIT"}
-            if self._daily_limit_hit():
+            daily_limit_hit = self._daily_limit_hit()
+            if daily_limit_hit is None:
+                return {"ok": False, "reason": "RISK_UNAVAILABLE"}
+            if daily_limit_hit:
                 self.state.update(paused=True, pause_reason="DAILY_LOSS_LIMIT")
                 self._persist()
                 return {"ok": False, "reason": "DAILY_LOSS_LIMIT"}
@@ -162,7 +321,10 @@ class PaperRiskEngine:
             if len(self.positions) >= self.config.max_open_positions:
                 return {"ok": False, "reason": "MAX_OPEN_POSITIONS"}
             stop_dist = market_price * self.config.stop_loss_pct
-            current_equity = max(0, self.equity())
+            current_equity = self.equity()
+            if current_equity is None:
+                return {"ok": False, "reason": "RISK_UNAVAILABLE"}
+            current_equity = max(0, current_equity)
             risk_cash = current_equity * self.config.risk_per_trade
             open_risk = sum(p["quantity"] * abs(p["entry_price"]-p["stop_loss"]) for p in self.positions.values())
             allowed_risk = max(0, current_equity*self.config.max_total_risk-open_risk)
@@ -192,13 +354,20 @@ class PaperRiskEngine:
                 return {"ok": False, "reason": "DATABASE_UNAVAILABLE"}
             return {"ok": True, "position": position}
 
-    def close_position(self, symbol, market_price, reason="MANUAL"):
+    def close_position(self, symbol, market_price, reason="MANUAL", *, signal_id=None,
+                       signal_outcome=None):
         with self.lock:
             if self.storage_failed:
                 return {"ok": False, "reason": "DATABASE_UNAVAILABLE"}
             pos = self.positions.get(symbol)
             if pos is None or market_price is None or market_price <= 0:
                 return {"ok": False, "reason": "NO_POSITION" if pos is None else "INVALID_PRICE"}
+            signal_record = None
+            if signal_id is not None:
+                signal_record = next((item for item in self.state.get("signals", [])
+                                      if item.get("signal_id") == signal_id), None)
+                if signal_record is None or not isinstance(signal_outcome, dict):
+                    return {"ok": False, "reason": "SIGNAL_NOT_FOUND"}
             impact = self.config.slippage_rate+self.config.assumed_spread_rate/2
             fill = market_price*(1-impact if pos["side"] == "BUY" else 1+impact)
             direction = 1 if pos["side"] == "BUY" else -1
@@ -216,23 +385,58 @@ class PaperRiskEngine:
             self.state["trades"].insert(0, trade)
             self.state["trades"] = self.state["trades"][:1000]
             del self.positions[symbol]
+            if signal_record is not None:
+                signal_record.update(signal_outcome)
             if self._daily_limit_hit():
                 self.state.update(paused=True, pause_reason="DAILY_LOSS_LIMIT")
             try:
-                self.store.persist_closed_trade(trade, self.state)
+                if signal_record is not None:
+                    self.store.persist_closed_trade(trade, self.state, signal_id=signal_id,
+                                                    signal=signal_record)
+                else:
+                    self.store.persist_closed_trade(trade, self.state)
             except Exception:
                 self.state = previous
                 self._mark_storage_failure()
                 return {"ok": False, "reason": "DATABASE_UNAVAILABLE"}
             return {"ok": True, "trade": trade}
 
-    def check_exits(self, prices):
+    def close_on_reverse_signal(self, symbol, signal_side, market_price, *, data_age_seconds,
+                                signal_id, signal_outcome):
+        """Atomically close an opposite PAPER position on a fresh valid signal."""
+        with self.lock:
+            if self.storage_failed:
+                return {"ok": False, "reason": "DATABASE_UNAVAILABLE"}
+            side = str(signal_side).upper()
+            if side not in ("BUY", "SELL"):
+                return {"ok": False, "reason": "INVALID_SIGNAL"}
+            try:
+                data_age_seconds = float(data_age_seconds)
+                market_price = float(market_price)
+            except (TypeError, ValueError):
+                return {"ok": False, "reason": "INVALID_MARKET_DATA"}
+            if (not math.isfinite(data_age_seconds) or data_age_seconds < 0
+                    or data_age_seconds > self.config.max_data_age_seconds):
+                return {"ok": False, "reason": "STALE_MARKET_DATA"}
+            if not math.isfinite(market_price) or market_price <= 0:
+                return {"ok": False, "reason": "INVALID_PRICE"}
+            position = self.positions.get(symbol)
+            if position is None:
+                return {"ok": False, "reason": "NO_POSITION"}
+            if position.get("side") == side:
+                return {"ok": False, "reason": "POSITION_ALREADY_OPEN"}
+            return self.close_position(symbol, market_price, "REVERSE_SIGNAL",
+                                        signal_id=signal_id, signal_outcome=signal_outcome)
+
+    def check_exits(self, prices, timestamps=None):
         closed = []
         with self.lock:
+            fresh_marks = self._fresh_price_marks(prices, timestamps)
             for symbol, pos in list(self.positions.items()):
-                price = prices.get(symbol)
-                if price is None:
+                mark = fresh_marks.get(symbol)
+                if mark is None:
                     continue
+                price = mark["price"]
                 if pos["side"] == "BUY":
                     reason = "STOP_LOSS" if price <= pos["stop_loss"] else "TAKE_PROFIT" if price >= pos["take_profit"] else None
                 else:
@@ -246,18 +450,29 @@ class PaperRiskEngine:
             self.state["last_market_warning"] = warning
             self._persist()
 
-    def set_prices(self, prices):
+    def set_prices(self, prices, timestamps=None):
         with self.lock:
+            now = datetime.now(timezone.utc)
+            supplied_timestamps = timestamps or {}
             valid_prices = {}
+            valid_timestamps = {}
             for symbol, price in prices.items():
-                try:
-                    price = float(price)
-                except (TypeError, ValueError):
+                price = self._valid_price(price)
+                if price is None:
                     continue
-                if math.isfinite(price) and price > 0:
-                    valid_prices[symbol] = price
+                source = supplied_timestamps.get(symbol) if hasattr(supplied_timestamps, "get") else None
+                timestamp = self._parse_market_timestamp(source)
+                if timestamp is None:
+                    continue
+                age = (now - timestamp).total_seconds()
+                if not math.isfinite(age) or age < 0 or age > self.config.max_data_age_seconds:
+                    continue
+                valid_prices[symbol] = price
+                valid_timestamps[symbol] = timestamp.isoformat()
             self.state.setdefault("last_prices", {}).update(valid_prices)
-            if self._daily_limit_hit():
+            self.state.setdefault("last_price_timestamps", {}).update(valid_timestamps)
+            daily_limit_hit = self._daily_limit_hit()
+            if daily_limit_hit is True:
                 self.state.update(paused=True, pause_reason="DAILY_LOSS_LIMIT")
             self._persist()
 
@@ -269,18 +484,26 @@ class PaperRiskEngine:
 
     def resume(self):
         with self.lock:
-            if self._daily_limit_hit():
+            daily_limit_hit = self._daily_limit_hit()
+            if daily_limit_hit is None:
+                return {"ok": False, "reason": "RISK_UNAVAILABLE"}
+            if daily_limit_hit:
                 return {"ok": False, "reason": "DAILY_LOSS_LIMIT_STILL_ACTIVE"}
             self.state.update(paused=False, pause_reason=None, emergency_stop=False)
             self._persist()
             return {"ok": True}
 
-    def snapshot(self, prices=None):
+    def snapshot(self, prices=None, timestamps=None):
         with self.lock:
-            prices = prices or {}
+            valuation = self._position_valuation(prices, timestamps)
+            positions = deepcopy(self.positions)
+            for symbol, position in positions.items():
+                position.update(valuation["position_values"][symbol])
             return {"mode": "PAPER_ONLY", "balance": round(self.balance, 2),
-                    "equity": round(self.equity(prices), 2),
+                    "equity": round(valuation["equity"], 2) if valuation["equity"] is not None else None,
+                    "equity_status": "CONFIRMED" if valuation["risk_calculation_available"] else "UNCONFIRMED",
                     "realized_pnl": round(self.balance-self.state["starting_balance"], 2),
-                    "unrealized_pnl": round(self.equity(prices)-self.balance, 2),
-                    "risk": self.risk_status(prices), "positions": self.positions.copy(),
+                    "unrealized_pnl": (round(valuation["unrealized_pnl"], 2)
+                                       if valuation["unrealized_pnl"] is not None else None),
+                    "risk": self.risk_status(prices, timestamps), "positions": positions,
                     "trades": self.state["trades"][:100], "signals": self.state["signals"][:100]}

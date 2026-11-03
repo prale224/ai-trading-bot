@@ -9,6 +9,10 @@ from contextlib import contextmanager
 EPHEMERAL_DB_PATH = "/tmp/paper_trading.sqlite3"
 
 
+class SignalStateInconsistency(RuntimeError):
+    """A signal row cannot be reconciled with the persisted bot snapshot."""
+
+
 def resolve_database_path():
     configured = os.environ.get("PAPER_DB_PATH", "").strip()
     allow_ephemeral_db = os.environ.get("PAPER_ALLOW_EPHEMERAL_DB", "").strip().lower() == "true"
@@ -71,10 +75,45 @@ class PaperStore:
             conn.execute("INSERT INTO bot_state(id,payload) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
                          (json.dumps(state, separators=(",", ":")),))
 
-    def record_signal(self, signal):
+    def persist_signal(self, signal, state):
+        """Insert a signal and its matching bot snapshot in one transaction."""
         with self.lock, self._connect() as conn:
-            conn.execute("INSERT OR IGNORE INTO signals(signal_id,symbol,payload,created_at) VALUES(?,?,?,?)",
-                         (signal["signal_id"], signal.get("symbol"), json.dumps(signal), signal.get("created_at")))
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute("INSERT OR IGNORE INTO signals(signal_id,symbol,payload,created_at) VALUES(?,?,?,?)",
+                                  (signal["signal_id"], signal.get("symbol"), json.dumps(signal), signal.get("created_at")))
+            if cursor.rowcount != 1:
+                stored_signal = conn.execute("SELECT payload FROM signals WHERE signal_id=?",
+                                             (signal["signal_id"],)).fetchone()
+                stored_state = conn.execute("SELECT payload FROM bot_state WHERE id=1").fetchone()
+                if stored_signal is None or stored_state is None:
+                    raise SignalStateInconsistency("duplicate signal cannot be reconciled with bot state")
+                try:
+                    stored_signal_payload = json.loads(stored_signal["payload"])
+                    stored_state_payload = json.loads(stored_state["payload"])
+                except (TypeError, ValueError) as exc:
+                    raise SignalStateInconsistency("stored signal or bot state is invalid") from exc
+                state_signals = stored_state_payload.get("signals") if isinstance(stored_state_payload, dict) else None
+                matching = ([item for item in state_signals if isinstance(item, dict)
+                             and item.get("signal_id") == signal["signal_id"]]
+                            if isinstance(state_signals, list) else [])
+                if len(matching) != 1 or matching[0] != stored_signal_payload:
+                    raise SignalStateInconsistency("signal exists in SQLite without matching bot state")
+                return False
+            conn.execute("INSERT INTO bot_state(id,payload) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
+                         (json.dumps(state, separators=(",", ":")),))
+            return True
+
+    def persist_signal_update(self, signal_id, signal, state):
+        """Persist a signal outcome and its corresponding bot state atomically."""
+        with self.lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute("UPDATE signals SET payload=? WHERE signal_id=?",
+                                  (json.dumps(signal), signal_id))
+            if cursor.rowcount != 1:
+                return False
+            conn.execute("INSERT INTO bot_state(id,payload) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
+                         (json.dumps(state, separators=(",", ":")),))
+            return True
 
     def order_exists(self, signal_id):
         with self.lock, self._connect() as conn:
@@ -102,11 +141,18 @@ class PaperStore:
             conn.execute("INSERT INTO trades(symbol,payload,closed_at) VALUES(?,?,?)",
                          (trade["symbol"], json.dumps(trade), trade["closed_at"]))
 
-    def persist_closed_trade(self, trade, state):
+    def persist_closed_trade(self, trade, state, *, signal_id=None, signal=None):
         with self.lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("INSERT INTO trades(symbol,payload,closed_at) VALUES(?,?,?)",
                          (trade["symbol"], json.dumps(trade), trade["closed_at"]))
+            if signal_id is not None:
+                if signal is None:
+                    raise ValueError("signal payload is required when persisting a signal outcome")
+                cursor = conn.execute("UPDATE signals SET payload=? WHERE signal_id=?",
+                                      (json.dumps(signal), signal_id))
+                if cursor.rowcount != 1:
+                    raise RuntimeError("signal record missing while persisting its close")
             conn.execute("INSERT INTO bot_state(id,payload) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
                          (json.dumps(state, separators=(",", ":")),))
 

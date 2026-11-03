@@ -133,16 +133,23 @@ def current_market_snapshot(market, now=None):
     age = market_data_age_seconds(snapshot, now)
     snapshot["data_age_seconds"] = age
     if age is None:
+        if snapshot.get("price") is not None:
+            snapshot["last_known_price"] = snapshot["price"]
+            snapshot["price"] = None
         if snapshot.get("updated"):
             snapshot["data_status"] = "invalid"
             snapshot["error"] = "Market data timestamp is invalid or in the future"
         else:
-            snapshot["data_status"] = snapshot.get("data_status") or "unavailable"
+            snapshot["data_status"] = "unavailable"
         return snapshot
     if age > config.max_data_age_seconds:
+        if snapshot.get("price") is not None:
+            snapshot["last_known_price"] = snapshot["price"]
+            snapshot["price"] = None
         snapshot["data_status"] = "stale"
         snapshot["error"] = "Stale cached market data"
     else:
+        snapshot.pop("last_known_price", None)
         snapshot["data_status"] = "fresh"
         if snapshot.get("error") in ("Stale cached market data",
                                       "Market data timestamp is invalid or in the future",
@@ -177,13 +184,18 @@ def process_market_cycle():
     fresh_quotes = {symbol: quote for symbol, market in results.items()
                     if (quote := fresh_market_quote(market)) is not None}
     fresh_prices = {symbol: quote[0] for symbol, quote in fresh_quotes.items()}
+    fresh_price_timestamps = {symbol: results[symbol].get("updated") for symbol in fresh_quotes}
     with market_lock:
         markets.clear()
         markets.update(results)
-    engine.set_prices(fresh_prices)
-    exit_prices = {symbol: quote[0] for symbol, market in results.items()
+    engine.set_prices(fresh_prices, timestamps=fresh_price_timestamps)
+    exit_quotes = {symbol: quote for symbol, market in results.items()
                    if (quote := fresh_market_quote(market)) is not None}
-    engine.check_exits(exit_prices)
+    exit_prices = {symbol: quote[0] for symbol, quote in exit_quotes.items()}
+    exit_timestamps = {symbol: results[symbol].get("updated") for symbol in exit_quotes}
+    exit_results = engine.check_exits(exit_prices, timestamps=exit_timestamps)
+    closed_symbols_this_cycle = {result["trade"]["symbol"] for result in exit_results
+                                 if result.get("ok") and result.get("trade", {}).get("symbol")}
     stale_symbols = [symbol for symbol, market in results.items()
                      if fresh_market_quote(market) is None]
     warning_parts = []
@@ -196,7 +208,8 @@ def process_market_cycle():
                              "new entries and automatic exits blocked for affected instruments")
         if affected_positions:
             warning_parts.append(f"open positions require attention: {', '.join(affected_positions)}")
-    known_signal_ids = {item.get("signal_id") for item in engine.state.get("signals", [])}
+    known_signals = {item.get("signal_id"): item for item in engine.state.get("signals", [])
+                     if item.get("signal_id")}
     for symbol, market in results.items():
         if market.get("signal") not in ("BUY", "SELL"):
             continue
@@ -204,17 +217,56 @@ def process_market_cycle():
         if quote is None:
             continue
         signal_id = hashlib.sha256(f"{symbol}|{market['updated']}|{market['signal']}".encode()).hexdigest()
-        if signal_id in known_signal_ids:
+        if signal_id in known_signals:
+            previous_signal = known_signals[signal_id]
+            for field in ("execution_action", "execution_status", "execution_reason"):
+                if field in previous_signal:
+                    market[field] = previous_signal[field]
+            if previous_signal.get("execution_status") == "FAILED":
+                warning_parts.append(f"Reverse-signal close failed for {symbol}: "
+                                     f"{previous_signal.get('execution_reason') or 'CLOSE_FAILED'}")
             continue
         signal = {**market, "signal_id": signal_id, "created_at": utc_now()}
-        engine.record_signal(signal)
-        known_signal_ids.add(signal_id)
+        if not engine.record_signal(signal):
+            continue
+        known_signals[signal_id] = signal
         quote = fresh_market_quote(market)
         if quote is None:
             continue
         price, age = quote
-        engine.open_position(symbol, market["signal"], price, signal_id=signal_id,
-                             spread_rate=market.get("spread_rate"), data_age_seconds=age)
+        position = engine.positions.get(symbol)
+        signal_result_persisted = False
+        if symbol in closed_symbols_this_cycle:
+            outcome = {"execution_action": "ENTRY_SKIPPED", "execution_status": "SKIPPED",
+                       "execution_reason": "POSITION_CLOSED_THIS_CYCLE"}
+        elif position and position.get("side") != market["signal"]:
+            reverse_outcome = {"execution_action": "REVERSE_EXIT", "execution_status": "CLOSED",
+                               "execution_reason": "REVERSE_SIGNAL"}
+            close_result = engine.close_on_reverse_signal(
+                symbol, market["signal"], price, data_age_seconds=age, signal_id=signal_id,
+                signal_outcome=reverse_outcome)
+            if close_result.get("ok"):
+                closed_symbols_this_cycle.add(symbol)
+                outcome = reverse_outcome
+                signal_result_persisted = True
+            else:
+                reason = close_result.get("reason") or "CLOSE_FAILED"
+                outcome = {"execution_action": "REVERSE_EXIT", "execution_status": "FAILED",
+                           "execution_reason": reason}
+                warning_parts.append(f"Reverse-signal close failed for {symbol}: {reason}")
+        elif position:
+            continue
+        else:
+            result = engine.open_position(symbol, market["signal"], price, signal_id=signal_id,
+                                          spread_rate=market.get("spread_rate"), data_age_seconds=age)
+            if result.get("ok"):
+                continue
+            outcome = {"execution_action": "ENTRY", "execution_status": "REJECTED",
+                       "execution_reason": result.get("reason") or "ORDER_REJECTED"}
+        market.update(outcome)
+        signal.update(outcome)
+        if not signal_result_persisted:
+            engine.update_signal_result(signal_id, outcome)
     engine.set_market_warning("; ".join(warning_parts) if warning_parts else None)
 
 
@@ -246,11 +298,11 @@ DASHBOARD = """<!doctype html><html><head><meta name="viewport" content="width=d
 <div class="grid" id="summary"></div><div class="card"><h3>Tržišni signali</h3><div id="markets"></div></div><div class="card"><h3>Otvorene pozicije</h3><div id="positions"></div></div><div class="card"><h3>Poslednje trgovine</h3><div id="trades"></div></div><p class="muted" id="updated"></p>
 <script>
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function load(){try{const r=await fetch('/status');const d=await r.json();const money=n=>Number(n||0).toFixed(2)+' '+(d.currency||'EUR');
+async function load(){try{const r=await fetch('/status');const d=await r.json();const money=n=>n==null?'Privremeno nedostupno':Number(n).toFixed(2)+' '+(d.currency||'EUR');
 document.getElementById('summary').innerHTML=[['Stanje',money(d.balance)],['Vrednost računa',money(d.equity)],['Realizovani P/L',money(d.realized_pnl)],['Nerealizovani P/L',money(d.unrealized_pnl)],['Režim',d.mode],['Emergency STOP',d.risk?.emergency_stop?'AKTIVAN':'isključen']].map(x=>'<div class="card"><div class="muted">'+esc(x[0])+'</div><div class="value">'+esc(x[1])+'</div></div>').join('');
-document.getElementById('warning').textContent=d.risk?.market_warning||d.risk?.pause_reason||'';
-document.getElementById('markets').innerHTML=Object.values(d.markets).map(m=>'<p><b>'+esc(m.symbol)+'</b> · '+esc(m.price??'—')+' · <b class="'+(m.signal==='BUY'?'buy':m.signal==='SELL'?'sell':'')+'">'+esc(m.signal)+'</b> · RSI '+esc(m.rsi??'—')+(m.data_age_seconds!=null?' · starost cene '+Math.round(m.data_age_seconds)+'s':' · starost cene nepoznata')+(m.error?' · '+esc(m.error):'')+(m.fetch_error?' · poslednja greška: '+esc(m.fetch_error):'')+(m.retry_after_seconds>0?' · sledeći pokušaj za '+Math.ceil(m.retry_after_seconds)+'s':'')+(m.last_success_at?' · poslednji uspeh '+esc(m.last_success_at):'')+'</p>').join('')||'Nema podataka';
-document.getElementById('positions').innerHTML=Object.values(d.positions).map(p=>'<p><b>'+esc(p.symbol)+' '+esc(p.side)+'</b> · ulaz '+esc(p.entry_price)+' · količina '+esc(p.quantity)+'<br>Stop Loss: '+esc(p.stop_loss)+' · Take Profit: '+esc(p.take_profit)+'</p>').join('')||'Nema otvorenih pozicija';
+document.getElementById('warning').textContent=[d.risk?.storage_warning,d.risk?.market_warning,d.risk?.valuation_warning,d.risk?.pause_reason].filter(Boolean).join(' · ');
+document.getElementById('markets').innerHTML=Object.values(d.markets).map(m=>'<p><b>'+esc(m.symbol)+'</b> · '+(m.price!=null?esc(m.price):m.last_known_price!=null?'poslednja poznata: '+esc(m.last_known_price):'cena nedostupna')+' · <b class="'+(m.signal==='BUY'?'buy':m.signal==='SELL'?'sell':'')+'">'+esc(m.signal)+'</b> · RSI '+esc(m.rsi??'—')+(m.data_age_seconds!=null?' · starost cene '+Math.round(m.data_age_seconds)+'s':' · starost cene nepoznata')+(m.error?' · '+esc(m.error):'')+(m.fetch_error?' · poslednja greška: '+esc(m.fetch_error):'')+(m.retry_after_seconds>0?' · sledeći pokušaj za '+Math.ceil(m.retry_after_seconds)+'s':'')+(m.last_success_at?' · poslednji uspeh '+esc(m.last_success_at):'')+(m.execution_status?' · izvršenje: '+esc(m.execution_status)+(m.execution_reason?' ('+esc(m.execution_reason)+')':''):'')+'</p>').join('')||'Nema podataka';
+document.getElementById('positions').innerHTML=Object.values(d.positions).map(p=>'<p><b>'+esc(p.symbol)+' '+esc(p.side)+'</b> · ulaz '+esc(p.entry_price)+' · količina '+esc(p.quantity)+'<br>Stop Loss: '+esc(p.stop_loss)+' · Take Profit: '+esc(p.take_profit)+'<br>Trenutna cena: '+(p.current_price==null?'nepotvrđena':esc(Number(p.current_price).toFixed(2)))+' · Nerealizovani P/L: '+esc(money(p.unrealized_pnl))+(p.valuation_warning?'<br><span class="warning">'+esc(p.valuation_warning)+'</span>':'')+'</p>').join('')||'Nema otvorenih pozicija';
 document.getElementById('trades').innerHTML=d.trades.length?'<table><tr><th>Instrument</th><th>Strana</th><th>P/L</th><th>Razlog</th></tr>'+d.trades.slice(0,15).map(t=>'<tr><td>'+esc(t.symbol)+'</td><td>'+esc(t.side)+'</td><td>'+money(t.pnl)+'</td><td>'+esc(t.reason)+'</td></tr>').join('')+'</table>':'Još nema zatvorenih trgovina';document.getElementById('updated').textContent='Poslednje ažuriranje: '+(d.last_update||'čeka se')+' · Status: '+d.status;
 }catch(e){document.getElementById('updated').textContent='Greška pri učitavanju: '+e}}load();setInterval(load,15000);
 </script></body></html>"""
@@ -267,9 +319,11 @@ def status():
     now = datetime.now(timezone.utc)
     with market_lock:
         current = {k: current_market_snapshot(v, now) for k, v in markets.items()}
-    prices = {symbol: quote[0] for symbol, market in current.items()
-              if (quote := fresh_market_quote(market, now)) is not None}
-    data = engine.snapshot(prices)
+    fresh_quotes = {symbol: quote for symbol, market in current.items()
+                    if (quote := fresh_market_quote(market, now)) is not None}
+    prices = {symbol: quote[0] for symbol, quote in fresh_quotes.items()}
+    price_timestamps = {symbol: current[symbol].get("updated") for symbol in fresh_quotes}
+    data = engine.snapshot(prices, timestamps=price_timestamps)
     data.update({"name": "AI Trading Bot V3", "mode": "PAPER TRADING ONLY", "status": "RUNNING" if monitor_started else "STARTING",
                  "starting_capital": engine.state["starting_balance"], "markets": current,
                  "currency": PAPER_CURRENCY,
@@ -305,7 +359,9 @@ def health():
     with market_lock:
         current = [current_market_snapshot(market, now) for market in markets.values()]
     has_fresh_market = any(fresh_market_quote(market, now) is not None for market in current)
-    status = "starting" if not monitor_started else "degraded" if risk.get("market_warning") or not has_fresh_market else "healthy"
+    status = "starting" if not monitor_started else "degraded" if (
+        risk.get("storage_failed") or risk.get("market_warning")
+        or risk.get("valuation_warning") or not has_fresh_market) else "healthy"
     return jsonify({"status": status, "mode": "PAPER_ONLY", "risk": risk})
 
 
