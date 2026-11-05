@@ -10,7 +10,7 @@ Install dependencies with `pip install -r requirements.txt`. Set `PAPER_API_TOKE
 gunicorn --workers 1 --threads 4 --bind 0.0.0.0:10000 main:app
 ```
 
-The dashboard is available at `/` and `/dashboard`; the existing API routes remain `/health`, `/status`, `/signals`, `/positions`, and `/trades`. Missing or weak required configuration causes startup to fail with an error that does not include the token.
+The dashboard shell is available at `/` and `/dashboard`. Enter the existing `PAPER_API_TOKEN` to view account data; the browser keeps it in session storage for that tab and does not put it in a URL. The `/status`, `/signals`, `/positions`, and `/trades` API routes require an `Authorization: Bearer <PAPER_API_TOKEN>` header. `/health` remains public for Render health checks and omits balances, positions, and risk amounts. Missing or weak required configuration causes startup to fail with an error that does not include the token.
 
 ## Render configuration
 
@@ -30,7 +30,7 @@ Massive requires an API key and appropriate index data entitlement. Its current 
 
 The monitor initiates at most one history fetch per symbol per `YF_MIN_FETCH_INTERVAL_SECONDS` (default `60`) and blocks fetches for all symbols during provider cooldown. HTTP 429 responses trigger exponential backoff with jitter from `YF_BACKOFF_BASE_SECONDS` (default `60`) up to `YF_BACKOFF_MAX_SECONDS` (default `900`); an exposed `Retry-After` value is honored. The dashboard reports the last fetch error, live candle age, and time until the next permitted request. Data older than `MAX_DATA_AGE_SECONDS` (default `180`) is displayed as stale and cannot be used to open or automatically close a position. A last-good quote may remain visible for diagnostics, but stale quote prices are excluded from risk updates and execution decisions.
 
-The token-protected PAPER control endpoints are `POST /paper/emergency-stop`, `POST /paper/resume`, `POST /paper/orders`, and `POST /paper/positions/<symbol>/close`. These routes only change simulator state. Emergency STOP is persisted and blocks new positions until explicitly resumed; the daily-loss limit cannot be resumed while still breached. The API token is never included in application log messages or the Render Blueprint.
+The PAPER account read APIs and control endpoints require the bearer token. Control endpoints are `POST /paper/emergency-stop`, `POST /paper/resume`, `POST /paper/orders`, and `POST /paper/positions/<symbol>/close`; these routes only change simulator state. Emergency STOP is persisted and blocks new positions until explicitly resumed; the daily-loss limit cannot be resumed while still breached. The API token is never included in application log messages, URLs, or the Render Blueprint.
 
 ## Tests
 
