@@ -579,6 +579,8 @@ class PaperRiskEngine:
 
     def resume(self):
         with self.lock:
+            if self.storage_failed:
+                return {"ok": False, "reason": "DATABASE_UNAVAILABLE"}
             daily_limit_hit = self._daily_limit_hit()
             if daily_limit_hit is None:
                 return {"ok": False, "reason": "RISK_UNAVAILABLE"}
