@@ -204,7 +204,7 @@ class PaperRiskEngine:
             }
         equity = self.balance + known_unrealized if not unpriced else None
         unrealized_pnl = known_unrealized if not unpriced else None
-        warning = (f"Vrednost računa nije dostupna; potrebni su sveži tržišni podaci za: {', '.join(sorted(unpriced))}"
+        warning = (f"Vrednost računa nije dostupna; nedostaje potvrđena tržišna ili likvidaciona procena za: {', '.join(sorted(unpriced))}"
                    if unpriced else None)
         return {"equity": equity, "unrealized_pnl": unrealized_pnl,
                 "unpriced_positions": sorted(unpriced), "position_values": position_values,
