@@ -393,18 +393,25 @@ def _monitor_dispatch_loop():
 
 
 DASHBOARD = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>AI Trading Bot V3</title>
-<style>body{font-family:Arial;background:#101418;color:#f1f5f9;margin:0;padding:18px}h1{font-size:24px}.muted{color:#9ca3af}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.card{background:#1c252d;border:1px solid #34414c;border-radius:12px;padding:14px;margin:10px 0}.value{font-size:23px;font-weight:bold;margin-top:7px}.buy{color:#4ade80}.sell{color:#fb7185}.warning{color:#fbbf24}</style></head><body>
-<h1>AI Trading Bot V3</h1><p class="muted">PAPER TRADING ONLY · simulacija · osvežavanje na 60 sekundi</p><div id="warning" class="warning"></div>
-<div class="grid" id="summary"></div><div class="card"><h3>Tržišni signali</h3><div id="markets"></div></div><div class="card"><h3>Otvorene pozicije</h3><div id="positions"></div></div><div class="card"><h3>Poslednje trgovine</h3><div id="trades"></div></div><p class="muted" id="updated"></p>
+<style>body{font-family:Arial;background:#101418;color:#f1f5f9;margin:0;padding:18px}h1{font-size:24px}.muted{color:#9ca3af}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.card{background:#1c252d;border:1px solid #34414c;border-radius:12px;padding:14px;margin:10px 0}.value{font-size:23px;font-weight:bold;margin-top:7px}.buy{color:#4ade80}.sell{color:#fb7185}.warning{color:#fbbf24}input,button{font:inherit;padding:10px;border-radius:6px;border:1px solid #526170}button{cursor:pointer;background:#34414c;color:#f1f5f9;margin-left:6px}input{background:#101418;color:#f1f5f9;min-width:min(360px,80vw)}[hidden]{display:none!important}</style></head><body>
+<h1>AI Trading Bot V3</h1><p class="muted">PAPER TRADING ONLY · simulacija · osvežavanje na 60 sekundi</p>
+<div class="card" id="access"><h3>Pristup PAPER dashboard-u</h3><p class="muted">Unesite PAPER API token. Token ostaje samo u ovoj sesiji pregledača.</p><form id="loginForm"><input id="token" type="password" autocomplete="current-password" required aria-label="PAPER API token"><button type="submit">Otvori dashboard</button></form><p id="authError" class="warning"></p></div>
+<main id="dashboard" hidden><button id="logout" type="button">Zaključaj dashboard</button><p id="warning" class="warning"></p>
+<div class="grid" id="summary"></div><div class="card"><h3>Tržišni signali</h3><div id="markets"></div></div><div class="card"><h3>Otvorene pozicije</h3><div id="positions"></div></div><div class="card"><h3>Poslednje trgovine</h3><div id="trades"></div></div><p class="muted" id="updated"></p></main>
 <script>
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function load(){try{const r=await fetch('/status');const d=await r.json();const money=n=>n==null?'Privremeno nedostupno':Number(n).toFixed(2)+' '+(d.currency||'EUR');
+function showAuth(message=''){document.getElementById('access').hidden=false;document.getElementById('dashboard').hidden=true;document.getElementById('authError').textContent=message}
+async function load(){const token=sessionStorage.getItem('paperApiToken');if(!token){showAuth('');return}try{const r=await fetch('/status',{headers:{Authorization:'Bearer '+token}});if(r.status===401){sessionStorage.removeItem('paperApiToken');showAuth('Token nije prihvaćen');return}if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();const money=n=>n==null?'Privremeno nedostupno':Number(n).toFixed(2)+' '+(d.currency||'EUR');
+document.getElementById('access').hidden=true;document.getElementById('dashboard').hidden=false;
 document.getElementById('summary').innerHTML=[['Stanje',money(d.balance)],['Vrednost računa',money(d.equity)],['Realizovani P/L',money(d.realized_pnl)],['Nerealizovani P/L',money(d.unrealized_pnl)],['Režim',d.mode],['Emergency STOP',d.risk?.emergency_stop?'AKTIVAN':'isključen']].map(x=>'<div class="card"><div class="muted">'+esc(x[0])+'</div><div class="value">'+esc(x[1])+'</div></div>').join('');
 document.getElementById('warning').textContent=[d.risk?.storage_warning,d.risk?.market_warning,d.risk?.valuation_warning,d.risk?.pause_reason].filter(Boolean).join(' · ');
 document.getElementById('markets').innerHTML=Object.values(d.markets).map(m=>'<p><b>'+esc(m.symbol)+'</b> · '+(m.price!=null?esc(m.price):m.last_known_price!=null?'poslednja poznata: '+esc(m.last_known_price):'cena nedostupna')+' · <b class="'+(m.signal==='BUY'?'buy':m.signal==='SELL'?'sell':'')+'">'+esc(m.signal)+'</b> · RSI '+esc(m.rsi??'—')+(m.data_age_seconds!=null?' · starost cene '+Math.round(m.data_age_seconds)+'s':' · starost cene nepoznata')+(m.data_source?' · izvor '+esc(m.data_source):'')+(m.data_interval?' · sveća '+esc(m.data_interval):'')+(m.error?' · '+esc(m.error):'')+(m.fetch_error?' · poslednja greška: '+esc(m.fetch_error):'')+(m.retry_after_seconds>0?' · sledeći pokušaj za '+Math.ceil(m.retry_after_seconds)+'s':'')+(m.last_success_at?' · poslednji uspeh '+esc(m.last_success_at):'')+(m.execution_status?' · izvršenje: '+esc(m.execution_status)+(m.execution_reason?' ('+esc(m.execution_reason)+')':''):'')+'</p>').join('')||'Nema podataka';
 document.getElementById('positions').innerHTML=Object.values(d.positions).map(p=>'<p><b>'+esc(p.symbol)+' '+esc(p.side)+'</b> · ulaz '+esc(p.entry_price)+' · količina '+esc(p.quantity)+'<br>Stop Loss: '+esc(p.stop_loss)+' · Take Profit: '+esc(p.take_profit)+'<br>Trenutna cena: '+(p.current_price==null?'nepotvrđena':esc(Number(p.current_price).toFixed(2)))+' · Nerealizovani P/L: '+esc(money(p.unrealized_pnl))+(p.valuation_warning?'<br><span class="warning">'+esc(p.valuation_warning)+'</span>':'')+'</p>').join('')||'Nema otvorenih pozicija';
 document.getElementById('trades').innerHTML=d.trades.length?'<table><tr><th>Instrument</th><th>Strana</th><th>P/L</th><th>Razlog</th></tr>'+d.trades.slice(0,15).map(t=>'<tr><td>'+esc(t.symbol)+'</td><td>'+esc(t.side)+'</td><td>'+money(t.pnl)+'</td><td>'+esc(t.reason)+'</td></tr>').join('')+'</table>':'Još nema zatvorenih trgovina';document.getElementById('updated').textContent='Poslednje ažuriranje: '+(d.last_update||'čeka se')+' · Status: '+d.status;
-}catch(e){document.getElementById('updated').textContent='Greška pri učitavanju: '+e}}load();setInterval(load,15000);
+}catch(e){document.getElementById('updated').textContent='Greška pri učitavanju: '+e}}
+document.getElementById('loginForm').addEventListener('submit',event=>{event.preventDefault();sessionStorage.setItem('paperApiToken',document.getElementById('token').value);document.getElementById('token').value='';load()});
+document.getElementById('logout').addEventListener('click',()=>{sessionStorage.removeItem('paperApiToken');showAuth('')});
+load();setInterval(load,15000);
 </script></body></html>"""
 
 
@@ -416,6 +423,8 @@ def dashboard():
 
 @app.route("/status")
 def status():
+    if not require_paper_token():
+        return jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"}), 401
     now = datetime.now(timezone.utc)
     with market_lock:
         current = {k: current_market_snapshot(v, now) for k, v in markets.items()}
@@ -435,6 +444,8 @@ def status():
 
 @app.route("/signals")
 def signals():
+    if not require_paper_token():
+        return jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"}), 401
     now = datetime.now(timezone.utc)
     with market_lock:
         current = {symbol: current_market_snapshot(market, now)
@@ -444,11 +455,15 @@ def signals():
 
 @app.route("/positions")
 def positions():
+    if not require_paper_token():
+        return jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"}), 401
     return jsonify(engine.snapshot()["positions"])
 
 
 @app.route("/trades")
 def trades():
+    if not require_paper_token():
+        return jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"}), 401
     return jsonify(engine.snapshot()["trades"])
 
 
@@ -473,7 +488,7 @@ def health():
     status = "starting" if not monitor_started else "degraded" if (
         risk.get("storage_failed") or risk.get("market_warning")
         or risk.get("valuation_warning") or not all_markets_fresh) else "healthy"
-    return jsonify({"status": status, "mode": "PAPER_ONLY", "risk": risk,
+    return jsonify({"status": status, "mode": "PAPER_ONLY",
                     "markets": market_data})
 
 
