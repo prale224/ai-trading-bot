@@ -2,6 +2,9 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify, render_template_string, request
 import builtins
 import hashlib
+import io
+import sqlite3
+import tempfile
 import hmac
 import math
 import os
@@ -423,6 +426,61 @@ def close_paper_position(symbol):
         return jsonify({"ok": False, "reason": "STALE_MARKET_DATA"}), 409
     result = engine.close_position(symbol, quote[0], "MANUAL")
     return jsonify(result), paper_result_status(result)
+
+
+
+@app.get("/paper/backup")
+def download_paper_backup():
+    """Download a consistent SQLite backup; requires the existing PAPER bearer token."""
+    if not require_paper_token():
+        response = jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"})
+        response.status_code = 401
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    backup_path = None
+    try:
+        with store.lock:
+            handle = tempfile.NamedTemporaryFile(prefix="paper-backup-", suffix=".sqlite3", delete=False)
+            backup_path = handle.name
+            handle.close()
+            source = sqlite3.connect(str(store.path), timeout=10)
+            destination = sqlite3.connect(backup_path, timeout=10)
+            try:
+                source.backup(destination)
+                check = destination.execute("PRAGMA integrity_check").fetchone()
+                if not check or check[0] != "ok":
+                    raise RuntimeError("SQLite backup integrity check failed")
+            finally:
+                destination.close()
+                source.close()
+            with open(backup_path, "rb") as backup_file:
+                payload = backup_file.read()
+
+        response = app.response_class(
+            io.BytesIO(payload),
+            mimetype="application/vnd.sqlite3",
+            headers={
+                "Content-Disposition": 'attachment; filename="paper_trading_backup.sqlite3"',
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+        return response
+    except Exception:
+        app.logger.exception("PAPER database backup failed")
+        response = jsonify({"ok": False, "reason": "BACKUP_FAILED"})
+        response.status_code = 503
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    finally:
+        if backup_path:
+            try:
+                os.unlink(backup_path)
+            except OSError:
+                app.logger.warning("Could not remove temporary PAPER backup file")
+
 
 
 def start_monitor():
