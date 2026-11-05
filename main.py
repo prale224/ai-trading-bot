@@ -299,6 +299,11 @@ def process_market_cycle():
     stale_symbols = [symbol for symbol, market in results.items()
                      if fresh_market_quote(market) is None]
     warning_parts = []
+    for result in exit_results:
+        if not result.get("ok"):
+            warning_parts.append(
+                f"Automatic close failed for {result.get('symbol', 'unknown')}: "
+                f"{result.get('reason') or 'CLOSE_FAILED'}")
     fetch_error_symbols = [symbol for symbol, market in results.items() if market.get("fetch_error")]
     if fetch_error_symbols:
         warning_parts.append(f"Yahoo Finance fetch error for {', '.join(fetch_error_symbols)}; cached quotes usable only while fresh")
