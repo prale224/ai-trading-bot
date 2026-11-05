@@ -102,7 +102,7 @@ class PaperRiskEngine:
     def _valid_price(value):
         try:
             price = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         return price if math.isfinite(price) and price > 0 else None
 
@@ -316,11 +316,11 @@ class PaperRiskEngine:
             market_price = self._valid_price(market_price)
             try:
                 data_age_seconds = float(data_age_seconds)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 data_age_seconds = None
             try:
                 spread_rate = float(spread_rate)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 spread_rate = None
             if side not in ("BUY", "SELL") or market_price is None:
                 return {"ok": False, "reason": "INVALID_ORDER"}
