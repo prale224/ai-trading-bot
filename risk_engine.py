@@ -542,7 +542,7 @@ class PaperRiskEngine:
 
     def set_market_warning(self, warning):
         with self.lock:
-            if self.state.get("last_market_warning") == warning:
+            if self.state.get("last_market_warning") == warning and not self.storage_failed:
                 return
             self.state["last_market_warning"] = warning
             self._persist()
@@ -569,9 +569,9 @@ class PaperRiskEngine:
             last_prices = self.state.setdefault("last_prices", {})
             last_timestamps = self.state.setdefault("last_price_timestamps", {})
             prices_changed = any(
-                last_prices.get(symbol) != price or last_timestamps.get(symbol) != timestamp
+                last_prices.get(symbol) != price
+                or last_timestamps.get(symbol) != valid_timestamps[symbol]
                 for symbol, price in valid_prices.items()
-                for timestamp in (valid_timestamps[symbol],)
             )
             risk_state_before = (self.state.get("day"), self.state.get("day_start_equity"),
                                  self.state.get("daily_realized_pnl"), self.state.get("paused"),
@@ -584,7 +584,7 @@ class PaperRiskEngine:
             risk_state_after = (self.state.get("day"), self.state.get("day_start_equity"),
                                 self.state.get("daily_realized_pnl"), self.state.get("paused"),
                                 self.state.get("pause_reason"))
-            if prices_changed or risk_state_before != risk_state_after:
+            if self.storage_failed or prices_changed or risk_state_before != risk_state_after:
                 self._persist()
 
     def emergency_stop(self):
