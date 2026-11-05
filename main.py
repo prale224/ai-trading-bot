@@ -102,7 +102,7 @@ def _fetch_massive_history(symbol):
     try:
         frame = pd.DataFrame(bars)
         frame["Close"] = pd.to_numeric(frame["c"], errors="coerce")
-        frame.index = pd.to_datetime(frame["t"], unit="ms", utc=True).tz_convert("America/New_York")
+        frame.index = pd.to_datetime(frame["t"], unit="ms", utc=True).dt.tz_convert("America/New_York")
         frame = frame[["Close"]].dropna()
     except (KeyError, TypeError, ValueError, OverflowError):
         return None, "Massive returned invalid index bars"
