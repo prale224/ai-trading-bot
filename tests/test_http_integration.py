@@ -94,12 +94,15 @@ def test_paper_currency_can_be_configured_explicitly(service, monkeypatch):
     assert main.app.test_client().get("/status").json["currency"] == "CAD"
 
 
-def test_health_is_degraded_without_fresh_market_data(service):
+def test_health_requires_fresh_data_for_each_market(service):
     main, client = service
     main.monitor_started = True
     main.markets.clear()
     assert client.get("/health").json["status"] == "degraded"
     main.markets["US100"] = {"symbol": "US100", "price": 20000, "signal": "WAIT",
+                             "updated": main.utc_now(), "data_age_seconds": 1, "error": None}
+    assert client.get("/health").json["status"] == "degraded"
+    main.markets["US500"] = {"symbol": "US500", "price": 5000, "signal": "WAIT",
                              "updated": main.utc_now(), "data_age_seconds": 1, "error": None}
     assert client.get("/health").json["status"] == "healthy"
 
