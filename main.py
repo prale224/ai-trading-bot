@@ -70,12 +70,21 @@ def calculate_rsi(series, period=14):
 
 
 def _analyze_market_uncached(symbol, ticker):
-    # Ticker.history propagates YFRateLimitError in the installed yfinance 1.7.0;
-    # yf.download catches per-ticker exceptions and returns an empty frame.
-    df = yf.Ticker(ticker).history(period="5d", interval="1m", actions=False,
-                                  auto_adjust=True, timeout=10)
-    if df.empty:
-        return {"symbol": symbol, "signal": "WAIT", "error": "No market data", "updated": None}
+    # Two-minute bars have a longer Yahoo intraday retention window than 1m.
+    # Fall back to 1m only when Yahoo has no 2m bars; never substitute a different instrument.
+    ticker_client = yf.Ticker(ticker)
+    df = None
+    data_interval = None
+    for interval in ("2m", "1m"):
+        candidate = ticker_client.history(period="5d", interval=interval, actions=False,
+                                          auto_adjust=True, timeout=10)
+        if not candidate.empty:
+            df = candidate
+            data_interval = interval
+            break
+    if df is None:
+        return {"symbol": symbol, "signal": "WAIT",
+                "error": "No Yahoo market data at 2m or 1m interval", "updated": None}
     close = df["Close"]
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
@@ -99,6 +108,7 @@ def _analyze_market_uncached(symbol, ticker):
         elif ema9.iloc[-1] < ema21.iloc[-1] and macd.iloc[-1] < macd_signal.iloc[-1] and 30 < rv < 50:
             signal = "SELL"
     return {"symbol": symbol, "price": float(close.iloc[-1]), "signal": signal,
+            "data_interval": data_interval,
             "rsi": round(rv, 2) if pd.notna(rv) else None, "ema9": float(ema9.iloc[-1]),
             "ema21": float(ema21.iloc[-1]), "macd": float(macd.iloc[-1]),
             "updated": updated, "data_age_seconds": age, "spread_rate": config.assumed_spread_rate,
