@@ -534,7 +534,10 @@ class PaperRiskEngine:
                 else:
                     reason = "STOP_LOSS" if price >= pos["stop_loss"] else "TAKE_PROFIT" if price <= pos["take_profit"] else None
                 if reason:
-                    closed.append(self.close_position(symbol, price, reason))
+                    result = self.close_position(symbol, price, reason)
+                    if not result.get("ok"):
+                        result = {**result, "symbol": symbol}
+                    closed.append(result)
             return closed
 
     def set_market_warning(self, warning):
