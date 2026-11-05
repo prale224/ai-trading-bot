@@ -451,18 +451,27 @@ class PaperRiskEngine:
                                       if item.get("signal_id") == signal_id), None)
                 if signal_record is None or not isinstance(signal_outcome, dict):
                     return {"ok": False, "reason": "SIGNAL_NOT_FOUND"}
+            if pos.get("side") not in ("BUY", "SELL"):
+                return {"ok": False, "reason": "INVALID_POSITION"}
             impact = self.config.slippage_rate+self.config.assumed_spread_rate/2
             fill = market_price*(1-impact if pos["side"] == "BUY" else 1+impact)
             direction = 1 if pos["side"] == "BUY" else -1
             gross = (fill-pos["entry_price"])*direction*pos["quantity"]
             exit_fee = fill*pos["quantity"]*self.config.fee_rate
             net = gross-exit_fee-pos["entry_fee"]
+            new_balance = self.balance + gross - exit_fee
+            new_daily_realized_pnl = self.state["daily_realized_pnl"] + net
+            total_fees = pos["entry_fee"] + exit_fee
+            if not all(math.isfinite(value) for value in (
+                    fill, gross, exit_fee, net, new_balance, new_daily_realized_pnl, total_fees,
+                    pos["entry_price"], pos["quantity"], pos["entry_fee"])):
+                return {"ok": False, "reason": "INVALID_PRICE"}
             previous = deepcopy(self.state)
-            self.state["balance"] += gross-exit_fee
-            self.state["daily_realized_pnl"] += net
+            self.state["balance"] = new_balance
+            self.state["daily_realized_pnl"] = new_daily_realized_pnl
             trade = {"symbol": symbol, "side": pos["side"], "entry_price": round(pos["entry_price"], 6),
                      "exit_price": round(fill, 6), "quantity": round(pos["quantity"], 8),
-                     "gross_pnl": round(gross, 6), "fees": round(pos["entry_fee"]+exit_fee, 6),
+                     "gross_pnl": round(gross, 6), "fees": round(total_fees, 6),
                      "net_pnl": round(net, 6), "pnl": round(net, 6), "reason": reason,
                      "opened_at": pos["opened_at"], "closed_at": self._now()}
             self.state["trades"].insert(0, trade)
@@ -496,7 +505,7 @@ class PaperRiskEngine:
             try:
                 data_age_seconds = float(data_age_seconds)
                 market_price = float(market_price)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return {"ok": False, "reason": "INVALID_MARKET_DATA"}
             if (not math.isfinite(data_age_seconds) or data_age_seconds < 0
                     or data_age_seconds > self.config.max_data_age_seconds):
