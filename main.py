@@ -530,14 +530,19 @@ def resume_paper():
 def manual_paper_order():
     if not require_paper_token():
         return jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"}), 401
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "reason": "INVALID_ORDER"}), 400
+    symbol = body.get("symbol")
+    if not isinstance(symbol, str) or symbol not in SYMBOLS:
+        return jsonify({"ok": False, "reason": "UNKNOWN_SYMBOL"}), 400
     now = datetime.now(timezone.utc)
     with market_lock:
-        market = current_market_snapshot(markets.get(body.get("symbol"), {}), now)
+        market = current_market_snapshot(markets.get(symbol, {}), now)
     quote = fresh_market_quote(market, now)
     if quote is None:
         return jsonify({"ok": False, "reason": "STALE_MARKET_DATA"}), 409
-    result = engine.open_position(body.get("symbol"), body.get("side"), quote[0],
+    result = engine.open_position(symbol, body.get("side"), quote[0],
                                  signal_id=body.get("signal_id"), spread_rate=market.get("spread_rate"),
                                  data_age_seconds=quote[1])
     return jsonify(result), paper_result_status(result)
@@ -547,6 +552,8 @@ def manual_paper_order():
 def close_paper_position(symbol):
     if not require_paper_token():
         return jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"}), 401
+    if symbol not in SYMBOLS:
+        return jsonify({"ok": False, "reason": "UNKNOWN_SYMBOL"}), 400
     now = datetime.now(timezone.utc)
     with market_lock:
         market = current_market_snapshot(markets.get(symbol, {}), now)
