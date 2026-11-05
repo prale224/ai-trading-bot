@@ -528,11 +528,15 @@ def paper_result_status(result):
 
 
 def require_paper_token():
-    token = os.environ.get("PAPER_API_TOKEN")
+    token = os.environ.get("PAPER_API_TOKEN", "").strip()
     if not token:
         return False
     supplied = request.headers.get("Authorization", "")
-    return hmac.compare_digest(supplied, f"Bearer {token}")
+    try:
+        return hmac.compare_digest(supplied.encode("utf-8"),
+                                   f"Bearer {token}".encode("utf-8"))
+    except (AttributeError, UnicodeEncodeError):
+        return False
 
 
 @app.post("/paper/emergency-stop")
