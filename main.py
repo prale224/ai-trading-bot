@@ -161,29 +161,40 @@ def _analyze_market_uncached(symbol, ticker):
     close = df["Close"]
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
-    close = close.dropna()
+    close = pd.to_numeric(close, errors="coerce").dropna()
+    close = close[close.map(lambda value: math.isfinite(float(value)) and float(value) > 0)]
+    close = close[~close.index.duplicated(keep="last")].sort_index()
     if len(close) < 35:
-        return {"symbol": symbol, "signal": "WAIT", "error": "Not enough candles", "updated": None}
+        return {"symbol": symbol, "signal": "WAIT", "error": "Not enough valid candles", "updated": None}
     ema9, ema21 = close.ewm(span=9, adjust=False).mean(), close.ewm(span=21, adjust=False).mean()
     rsi = calculate_rsi(close)
     macd = close.ewm(span=12, adjust=False).mean()-close.ewm(span=26, adjust=False).mean()
     macd_signal = macd.ewm(span=9, adjust=False).mean()
+    price_value = float(close.iloc[-1])
+    ema9_value, ema21_value = float(ema9.iloc[-1]), float(ema21.iloc[-1])
+    macd_value, macd_signal_value = float(macd.iloc[-1]), float(macd_signal.iloc[-1])
+    rv = float(rsi.iloc[-1])
+    if (not all(math.isfinite(value) for value in
+                (price_value, ema9_value, ema21_value, macd_value, macd_signal_value))
+            or (not math.isfinite(rv) and not math.isnan(rv))
+            or (math.isfinite(rv) and not 0 <= rv <= 100)):
+        return {"symbol": symbol, "signal": "WAIT", "error": "Market indicators are invalid",
+                "updated": None}
     timestamp = pd.Timestamp(close.index[-1])
     if timestamp.tzinfo is None:
         timestamp = timestamp.tz_localize("UTC")
     updated = timestamp.tz_convert("UTC").isoformat()
     age = max(0, (datetime.now(timezone.utc)-datetime.fromisoformat(updated)).total_seconds())
-    rv = float(rsi.iloc[-1])
     signal = "WAIT"
-    if pd.notna(rv):
-        if ema9.iloc[-1] > ema21.iloc[-1] and macd.iloc[-1] > macd_signal.iloc[-1] and 50 < rv < 70:
+    if math.isfinite(rv):
+        if ema9_value > ema21_value and macd_value > macd_signal_value and 50 < rv < 70:
             signal = "BUY"
-        elif ema9.iloc[-1] < ema21.iloc[-1] and macd.iloc[-1] < macd_signal.iloc[-1] and 30 < rv < 50:
+        elif ema9_value < ema21_value and macd_value < macd_signal_value and 30 < rv < 50:
             signal = "SELL"
-    return {"symbol": symbol, "price": float(close.iloc[-1]), "signal": signal,
+    return {"symbol": symbol, "price": price_value, "signal": signal,
             "data_interval": data_interval, "data_source": data_source,
-            "rsi": round(rv, 2) if pd.notna(rv) else None, "ema9": float(ema9.iloc[-1]),
-            "ema21": float(ema21.iloc[-1]), "macd": float(macd.iloc[-1]),
+            "rsi": round(rv, 2) if math.isfinite(rv) else None, "ema9": ema9_value,
+            "ema21": ema21_value, "macd": macd_value,
             "updated": updated, "data_age_seconds": age, "spread_rate": config.assumed_spread_rate,
             "spread_source": "configured paper estimate (yfinance does not provide bid/ask)"}
 
