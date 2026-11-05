@@ -107,6 +107,16 @@ class PaperRiskEngine:
             return None
         return price if math.isfinite(price) and price > 0 else None
 
+    def _stop_loss_risk_per_unit(self, side, entry_price, stop_price):
+        """Estimate loss per unit at the stop, including modeled exit impact and fees."""
+        exit_impact = self.config.slippage_rate + self.config.assumed_spread_rate / 2
+        exit_fill = stop_price * (1 - exit_impact if side == "BUY" else 1 + exit_impact)
+        gross_loss = entry_price - exit_fill if side == "BUY" else exit_fill - entry_price
+        total = gross_loss + (entry_price + exit_fill) * self.config.fee_rate
+        if not math.isfinite(exit_fill) or exit_fill <= 0 or not math.isfinite(total) or total <= 0:
+            return None
+        return total
+
     def _fresh_price_marks(self, prices=None, timestamps=None, now=None):
         """Return only marks whose source timestamps are still within the age limit."""
         current = now or datetime.now(timezone.utc)
@@ -360,15 +370,25 @@ class PaperRiskEngine:
             if (not math.isfinite(stop_dist) or stop_dist <= 0 or
                     not math.isfinite(stop) or not math.isfinite(target) or target <= 0):
                 return {"ok": False, "reason": "INVALID_PRICE"}
+            risk_per_unit = self._stop_loss_risk_per_unit(side, fill, stop)
+            if risk_per_unit is None:
+                return {"ok": False, "reason": "RISK_UNAVAILABLE"}
 
             current_equity = self.equity()
             if current_equity is None:
                 return {"ok": False, "reason": "RISK_UNAVAILABLE"}
             current_equity = max(0, current_equity)
             risk_cash = current_equity * self.config.risk_per_trade
-            open_risk = sum(p["quantity"] * abs(p["entry_price"]-p["stop_loss"]) for p in self.positions.values())
+            open_risk = 0.0
+            for position in self.positions.values():
+                position_risk = self._stop_loss_risk_per_unit(
+                    position["side"], position["entry_price"], position["stop_loss"])
+                if position_risk is None or not math.isfinite(position["quantity"]):
+                    open_risk = math.inf
+                    break
+                open_risk += position["quantity"] * position_risk
             allowed_risk = max(0, current_equity*self.config.max_total_risk-open_risk)
-            qty_risk = min(risk_cash, allowed_risk) / stop_dist
+            qty_risk = min(risk_cash, allowed_risk) / risk_per_unit
             entry_cost_factor = 1+self.config.fee_rate+self.config.slippage_rate+spread_rate/2
             qty_cash = max(self.balance, 0)*self.config.max_notional_multiple/(market_price*entry_cost_factor)
             quantity = min(qty_risk, qty_cash)
