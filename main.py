@@ -25,6 +25,12 @@ from runtime_config import validate_runtime_environment
 
 RUNTIME_CONFIG = validate_runtime_environment()
 app = Flask(__name__)
+
+@app.after_request
+def prevent_response_caching(response):
+    """Keep live status, risk, and paper-operation responses out of HTTP caches."""
+    response.headers.setdefault("Cache-Control", "no-store")
+    return response
 SYMBOLS = {"US100": "^NDX", "US500": "^GSPC"}
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "60"))
 PAPER_CURRENCY = os.environ.get("PAPER_CURRENCY", "EUR").strip().upper() or "EUR"
