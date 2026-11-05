@@ -172,7 +172,27 @@ class PaperRiskEngine:
                 }
                 continue
             direction = 1 if position["side"] == "BUY" else -1
-            unrealized = (mark["price"] - position["entry_price"]) * direction * position["quantity"]
+            exit_impact = self.config.slippage_rate + self.config.assumed_spread_rate / 2
+            liquidation_price = mark["price"] * (
+                1 - exit_impact if position["side"] == "BUY" else 1 + exit_impact)
+            gross_unrealized = ((liquidation_price - position["entry_price"])
+                                * direction * position["quantity"])
+            exit_fee = liquidation_price * position["quantity"] * self.config.fee_rate
+            # Entry fees are already deducted from balance; this mark-to-liquidation
+            # P/L includes the modeled cost of closing the open position.
+            unrealized = gross_unrealized - exit_fee
+            if not all(math.isfinite(value) for value in (liquidation_price, gross_unrealized,
+                                                          exit_fee, unrealized)):
+                unpriced.append(symbol)
+                position_values[symbol] = {
+                    "current_price": mark["price"],
+                    "unrealized_pnl": None,
+                    "valuation_status": "UNCONFIRMED",
+                    "price_updated_at": mark["updated_at"],
+                    "price_age_seconds": mark["age_seconds"],
+                    "valuation_warning": "Vrednovanje PAPER zatvaranja nije numerički dostupno",
+                }
+                continue
             known_unrealized += unrealized
             position_values[symbol] = {
                 "current_price": mark["price"],
