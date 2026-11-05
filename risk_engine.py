@@ -339,9 +339,12 @@ class PaperRiskEngine:
             self._roll_day()
             if self.storage_failed:
                 return {"ok": False, "reason": "DATABASE_UNAVAILABLE"}
-            if not signal_id:
-                return {"ok": False, "reason": "SIGNAL_ID_REQUIRED"}
-            side = str(side).upper()
+            if (not isinstance(signal_id, str) or not signal_id.strip()
+                    or len(signal_id) > 128):
+                return {"ok": False, "reason": "INVALID_SIGNAL_ID"}
+            if not isinstance(side, str):
+                return {"ok": False, "reason": "INVALID_ORDER"}
+            side = side.upper()
             if self.state["emergency_stop"] or self.state["paused"]:
                 return {"ok": False, "reason": self.state["pause_reason"] or "EMERGENCY_STOP"}
             market_price = self._valid_price(market_price)
