@@ -515,7 +515,13 @@ def require_paper_token():
 def emergency_stop():
     if not require_paper_token():
         return jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"}), 401
-    return jsonify({"ok": True, "risk": engine.emergency_stop()})
+    try:
+        risk = engine.emergency_stop()
+    except Exception:
+        return jsonify({"ok": False, "reason": "DATABASE_UNAVAILABLE",
+                        "stop_active": True, "stop_persisted": False,
+                        "risk": engine.risk_status()}), 503
+    return jsonify({"ok": True, "risk": risk})
 
 
 @app.post("/paper/resume")
