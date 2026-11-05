@@ -84,14 +84,25 @@ class MarketDataCache:
                  backoff_base_seconds=60, backoff_max_seconds=900,
                  monotonic=time.monotonic, utcnow=lambda: datetime.now(timezone.utc),
                  uniform=random.uniform):
+        try:
+            max_data_age_seconds = float(max_data_age_seconds)
+            min_fetch_interval_seconds = float(min_fetch_interval_seconds)
+            backoff_base_seconds = float(backoff_base_seconds)
+            backoff_max_seconds = float(backoff_max_seconds)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("market-data timing settings must be finite numbers") from exc
+        settings = (max_data_age_seconds, min_fetch_interval_seconds,
+                    backoff_base_seconds, backoff_max_seconds)
+        if not all(math.isfinite(value) for value in settings):
+            raise ValueError("market-data timing settings must be finite numbers")
         if max_data_age_seconds < 1:
             raise ValueError("max_data_age_seconds must be positive")
         if min_fetch_interval_seconds <= 0 or backoff_base_seconds <= 0 or backoff_max_seconds <= 0:
             raise ValueError("fetch interval and backoff settings are invalid")
-        self.max_data_age_seconds = float(max_data_age_seconds)
-        self.min_fetch_interval_seconds = float(min_fetch_interval_seconds)
-        self.backoff_base_seconds = float(backoff_base_seconds)
-        self.backoff_max_seconds = float(backoff_max_seconds)
+        self.max_data_age_seconds = max_data_age_seconds
+        self.min_fetch_interval_seconds = min_fetch_interval_seconds
+        self.backoff_base_seconds = backoff_base_seconds
+        self.backoff_max_seconds = backoff_max_seconds
         self._monotonic = monotonic
         self._utcnow = utcnow
         self._uniform = uniform
@@ -132,7 +143,11 @@ class MarketDataCache:
         if last_attempt is not None:
             next_allowed = max(next_allowed, last_attempt + self.min_fetch_interval_seconds)
         remaining = max(0.0, next_allowed - now_monotonic)
-        retry_at = _as_utc_datetime(self._utcnow()) + timedelta(seconds=remaining)
+        try:
+            retry_at = _as_utc_datetime(self._utcnow()) + timedelta(seconds=remaining)
+        except OverflowError:
+            # An extreme but finite Retry-After must not break the market monitor.
+            retry_at = datetime.max.replace(tzinfo=timezone.utc)
         return remaining, retry_at.isoformat() if remaining > 0 else None
 
     def _snapshot(self, symbol, now_monotonic):
