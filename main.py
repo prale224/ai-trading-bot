@@ -262,7 +262,7 @@ def fresh_market_quote(market, now=None):
         return None
     try:
         price = float(market.get("price"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     age = market_data_age_seconds(market, now)
     if age is None:
