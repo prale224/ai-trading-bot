@@ -89,6 +89,8 @@ def _fetch_massive_history(symbol):
         return None, None
     if os.environ.get("MASSIVE_STRATEGY_LICENSE_CONFIRMED", "").strip().lower() != "true":
         return None, "Massive fallback disabled until data-use rights are confirmed"
+    if os.environ.get("MASSIVE_PROVIDER_COSTS_CONFIRMED", "").strip().lower() != "true":
+        return None, "Massive fallback disabled until provider costs are explicitly confirmed"
 
     end_date = datetime.now(timezone.utc).date()
     start_date = end_date - timedelta(days=5)
