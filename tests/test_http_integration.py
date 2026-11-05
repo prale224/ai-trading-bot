@@ -33,7 +33,9 @@ def service(tmp_path, monkeypatch):
                   "updated": main.utc_now(), "data_age_seconds": 1,
                   "spread_rate": 0.0002}
     })
-    return main, main.app.test_client()
+    client = main.app.test_client()
+    client.environ_base["HTTP_AUTHORIZATION"] = "Bearer integration-test-token-with-at-least-32-characters"
+    return main, client
 
 
 def test_read_only_http_routes_and_dashboard(service):
@@ -45,6 +47,10 @@ def test_read_only_http_routes_and_dashboard(service):
     assert "sledeći pokušaj za".encode() in dashboard
     assert "starost cene".encode() in dashboard
     assert client.get("/health").json["mode"] == "PAPER_ONLY"
+    assert "risk" not in client.get("/health").json
+    anonymous = main.app.test_client()
+    for path in ("/status", "/signals", "/positions", "/trades"):
+        assert anonymous.get(path).status_code == 401
     status = client.get("/status")
     assert status.status_code == 200
     assert status.json["mode"] == "PAPER TRADING ONLY"
@@ -673,13 +679,13 @@ main.app.run(host='127.0.0.1', port=int(__import__('os').environ['PORT']), use_r
 
     process, base, _ = launch()
     try:
-        status, payload, _ = _http(base + "/status")
+        status, payload, _ = _http(base + "/status", "integration-test-token-with-at-least-32-characters")
         assert status == 200
         restored = json.loads(payload)
         assert restored["balance"] < 100
         assert restored["positions"] == {}
         assert len(restored["trades"]) == 1
-        assert _http(base + "/trades")[0] == 200
+        assert _http(base + "/trades", "integration-test-token-with-at-least-32-characters")[0] == 200
     finally:
         process.terminate()
         process.wait(timeout=10)
