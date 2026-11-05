@@ -44,9 +44,10 @@ class PaperRiskEngine:
             if not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError(f"{name} must be a finite number")
         if (self.config.starting_balance <= 0 or self.config.max_notional_multiple <= 0
-                or not 0 < self.config.stop_loss_pct < 1 or self.config.take_profit_pct <= 0):
+                or not 0 < self.config.stop_loss_pct < 1
+                or not 0 < self.config.take_profit_pct < 1):
             raise ValueError("starting balance and notional multiple must be positive; "
-                            "stop loss must be between 0 and 1; take profit must be positive")
+                            "stop loss and take profit must be between 0 and 1")
         for name in ("risk_per_trade", "max_daily_loss", "max_total_risk", "max_spread_rate"):
             value = getattr(self.config, name)
             if not 0 < value <= 1:
@@ -357,7 +358,7 @@ class PaperRiskEngine:
             target = fill*(1+self.config.take_profit_pct if side == "BUY" else 1-self.config.take_profit_pct)
             stop_dist = abs(fill-stop)
             if (not math.isfinite(stop_dist) or stop_dist <= 0 or
-                    not math.isfinite(stop) or not math.isfinite(target)):
+                    not math.isfinite(stop) or not math.isfinite(target) or target <= 0):
                 return {"ok": False, "reason": "INVALID_PRICE"}
 
             current_equity = self.equity()
