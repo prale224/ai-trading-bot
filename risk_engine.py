@@ -34,16 +34,32 @@ class PaperRiskEngine:
     def __init__(self, store, config=None):
         self.store = store
         self.config = config or RiskConfig()
-        if self.config.starting_balance <= 0 or self.config.stop_loss_pct <= 0 or self.config.take_profit_pct <= 0:
-            raise ValueError("starting balance, stop loss, and take profit must be positive")
+        numeric_settings = (
+            "starting_balance", "risk_per_trade", "max_daily_loss", "max_total_risk",
+            "max_notional_multiple", "stop_loss_pct", "take_profit_pct", "fee_rate",
+            "slippage_rate", "assumed_spread_rate", "max_spread_rate",
+        )
+        for name in numeric_settings:
+            value = getattr(self.config, name)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number")
+        if (self.config.starting_balance <= 0 or self.config.max_notional_multiple <= 0
+                or not 0 < self.config.stop_loss_pct < 1 or self.config.take_profit_pct <= 0):
+            raise ValueError("starting balance and notional multiple must be positive; "
+                            "stop loss must be between 0 and 1; take profit must be positive")
         for name in ("risk_per_trade", "max_daily_loss", "max_total_risk", "max_spread_rate"):
             value = getattr(self.config, name)
             if not 0 < value <= 1:
                 raise ValueError(f"{name} must be greater than 0 and at most 1")
         if self.config.max_open_positions < 1 or self.config.max_data_age_seconds < 1:
             raise ValueError("position and market-data limits must be positive")
-        if min(self.config.fee_rate, self.config.slippage_rate, self.config.assumed_spread_rate) < 0:
-            raise ValueError("fees, slippage, and spread estimates cannot be negative")
+        for name in ("fee_rate", "slippage_rate", "assumed_spread_rate"):
+            value = getattr(self.config, name)
+            if not 0 <= value <= 1:
+                raise ValueError(f"{name} must be between 0 and 1")
+        if (self.config.slippage_rate + self.config.max_spread_rate / 2 >= 1
+                or self.config.slippage_rate + self.config.assumed_spread_rate / 2 >= 1):
+            raise ValueError("simulated slippage and spread must remain below the full price")
         self.lock = threading.RLock()
         self.storage_failed = False
         self.state = store.load_state() or {
