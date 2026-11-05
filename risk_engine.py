@@ -313,11 +313,22 @@ class PaperRiskEngine:
             side = str(side).upper()
             if self.state["emergency_stop"] or self.state["paused"]:
                 return {"ok": False, "reason": self.state["pause_reason"] or "EMERGENCY_STOP"}
-            if side not in ("BUY", "SELL") or market_price is None or market_price <= 0:
+            market_price = self._valid_price(market_price)
+            try:
+                data_age_seconds = float(data_age_seconds)
+            except (TypeError, ValueError):
+                data_age_seconds = None
+            try:
+                spread_rate = float(spread_rate)
+            except (TypeError, ValueError):
+                spread_rate = None
+            if side not in ("BUY", "SELL") or market_price is None:
                 return {"ok": False, "reason": "INVALID_ORDER"}
-            if data_age_seconds is None or data_age_seconds > self.config.max_data_age_seconds:
+            if (data_age_seconds is None or not math.isfinite(data_age_seconds)
+                    or data_age_seconds < 0 or data_age_seconds > self.config.max_data_age_seconds):
                 return {"ok": False, "reason": "STALE_MARKET_DATA"}
-            if spread_rate is None or spread_rate > self.config.max_spread_rate:
+            if (spread_rate is None or not math.isfinite(spread_rate)
+                    or spread_rate < 0 or spread_rate > self.config.max_spread_rate):
                 return {"ok": False, "reason": "SPREAD_LIMIT"}
             daily_limit_hit = self._daily_limit_hit()
             if daily_limit_hit is None:
@@ -376,8 +387,11 @@ class PaperRiskEngine:
             if self.storage_failed:
                 return {"ok": False, "reason": "DATABASE_UNAVAILABLE"}
             pos = self.positions.get(symbol)
-            if pos is None or market_price is None or market_price <= 0:
-                return {"ok": False, "reason": "NO_POSITION" if pos is None else "INVALID_PRICE"}
+            if pos is None:
+                return {"ok": False, "reason": "NO_POSITION"}
+            market_price = self._valid_price(market_price)
+            if market_price is None:
+                return {"ok": False, "reason": "INVALID_PRICE"}
             signal_record = None
             if signal_id is not None:
                 signal_record = next((item for item in self.state.get("signals", [])
