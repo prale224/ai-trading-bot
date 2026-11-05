@@ -126,11 +126,18 @@ def _analyze_market_uncached(symbol, ticker):
                 raise
             yahoo_error = f"Yahoo request failed ({type(exc).__name__})"
             continue
-        if not candidate.empty:
-            df = candidate
-            data_interval = interval
-            data_source = "Yahoo Finance"
-            break
+        if candidate.empty:
+            continue
+        candidate_close = candidate["Close"]
+        if isinstance(candidate_close, pd.DataFrame):
+            candidate_close = candidate_close.iloc[:, 0]
+        if len(candidate_close.dropna()) < 35:
+            yahoo_error = "Yahoo returned fewer than 35 candles"
+            continue
+        df = candidate
+        data_interval = interval
+        data_source = "Yahoo Finance"
+        break
     if df is None:
         df, massive_error = _fetch_massive_history(symbol)
         if df is not None:
