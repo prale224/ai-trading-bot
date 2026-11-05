@@ -211,6 +211,15 @@ def market_data_age_seconds(market, now=None):
         return None
 
 
+def _suppress_unfresh_signal(snapshot):
+    signal = snapshot.get("signal")
+    if signal in ("BUY", "SELL"):
+        snapshot["last_known_signal"] = signal
+    else:
+        snapshot.pop("last_known_signal", None)
+    snapshot["signal"] = "WAIT"
+
+
 def current_market_snapshot(market, now=None):
     """Copy a market result with age/status recalculated for the current request."""
     snapshot = dict(market)
@@ -225,6 +234,7 @@ def current_market_snapshot(market, now=None):
             snapshot["error"] = "Market data timestamp is invalid or in the future"
         else:
             snapshot["data_status"] = "unavailable"
+        _suppress_unfresh_signal(snapshot)
         return snapshot
     if age > config.max_data_age_seconds:
         if snapshot.get("price") is not None:
@@ -239,6 +249,10 @@ def current_market_snapshot(market, now=None):
                                       "Market data timestamp is invalid or in the future",
                                       "Market data timestamp is in the future"):
             snapshot["error"] = None
+    if fresh_market_quote(snapshot, now) is None:
+        _suppress_unfresh_signal(snapshot)
+    else:
+        snapshot.pop("last_known_signal", None)
     return snapshot
 
 
