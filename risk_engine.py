@@ -347,7 +347,19 @@ class PaperRiskEngine:
                 return {"ok": False, "reason": "POSITION_ALREADY_OPEN"}
             if len(self.positions) >= self.config.max_open_positions:
                 return {"ok": False, "reason": "MAX_OPEN_POSITIONS"}
-            stop_dist = market_price * self.config.stop_loss_pct
+            # Size against the simulated fill and its actual stop distance so spread
+            # and slippage cannot push the position beyond the configured risk cap.
+            impact = self.config.slippage_rate + spread_rate/2
+            fill = market_price*(1+impact if side == "BUY" else 1-impact)
+            if not math.isfinite(fill) or fill <= 0:
+                return {"ok": False, "reason": "INVALID_PRICE"}
+            stop = fill*(1-self.config.stop_loss_pct if side == "BUY" else 1+self.config.stop_loss_pct)
+            target = fill*(1+self.config.take_profit_pct if side == "BUY" else 1-self.config.take_profit_pct)
+            stop_dist = abs(fill-stop)
+            if (not math.isfinite(stop_dist) or stop_dist <= 0 or
+                    not math.isfinite(stop) or not math.isfinite(target)):
+                return {"ok": False, "reason": "INVALID_PRICE"}
+
             current_equity = self.equity()
             if current_equity is None:
                 return {"ok": False, "reason": "RISK_UNAVAILABLE"}
@@ -359,16 +371,16 @@ class PaperRiskEngine:
             entry_cost_factor = 1+self.config.fee_rate+self.config.slippage_rate+spread_rate/2
             qty_cash = max(self.balance, 0)*self.config.max_notional_multiple/(market_price*entry_cost_factor)
             quantity = min(qty_risk, qty_cash)
+            if not all(math.isfinite(value) for value in (risk_cash, open_risk, allowed_risk,
+                                                          qty_risk, qty_cash, quantity)):
+                return {"ok": False, "reason": "RISK_UNAVAILABLE"}
             if quantity <= 0:
                 return {"ok": False, "reason": "MAX_TOTAL_RISK" if allowed_risk <= 0 else "INSUFFICIENT_SIMULATED_BALANCE"}
-            # Paper fill includes half-spread plus configured slippage.
-            impact = self.config.slippage_rate + spread_rate/2
-            fill = market_price*(1+impact if side == "BUY" else 1-impact)
             fee = fill*quantity*self.config.fee_rate
+            if not math.isfinite(fee):
+                return {"ok": False, "reason": "RISK_UNAVAILABLE"}
             previous = deepcopy(self.state)
             self.state["balance"] -= fee
-            stop = fill*(1-self.config.stop_loss_pct if side == "BUY" else 1+self.config.stop_loss_pct)
-            target = fill*(1+self.config.take_profit_pct if side == "BUY" else 1-self.config.take_profit_pct)
             position = {"symbol": symbol, "side": side, "entry_price": fill, "quantity": quantity,
                         "stop_loss": stop, "take_profit": target, "opened_at": self._now(),
                         "entry_fee": fee, "signal_id": signal_id}
