@@ -141,6 +141,12 @@ def _analyze_market_uncached(symbol, ticker):
         if candidate.empty:
             yahoo_errors.append(f"Yahoo returned no {interval} candles")
             continue
+        candidate = candidate.copy()
+        candidate.index = pd.to_datetime(candidate.index, utc=True, errors="coerce")
+        candidate = candidate.loc[~candidate.index.isna()]
+        if candidate.empty:
+            yahoo_errors.append(f"Yahoo {interval} returned no valid candle timestamps")
+            continue
         candidate_close = candidate["Close"]
         if isinstance(candidate_close, pd.DataFrame):
             candidate_close = candidate_close.iloc[:, 0]
