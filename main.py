@@ -375,12 +375,21 @@ def process_market_cycle():
     engine.set_market_warning("; ".join(warning_parts) if warning_parts else None)
 
 
+def _handle_market_monitor_error(exc):
+    """Keep monitor failures visible without letting warning persistence kill the loop."""
+    try:
+        engine.set_market_warning(f"Market monitor error: {type(exc).__name__}")
+    except Exception:
+        app.logger.error("Market monitor error could not be persisted (%s)",
+                         type(exc).__name__)
+
+
 def market_monitor():
     while True:
         try:
             process_market_cycle()
         except Exception as exc:
-            engine.set_market_warning(f"Market monitor error: {exc}")
+            _handle_market_monitor_error(exc)
         time.sleep(REFRESH_SECONDS)
 
 
@@ -393,7 +402,11 @@ def _monitor_dispatch_loop():
             try:
                 cycle()
             except Exception as exc:
-                registry["on_error"](exc)
+                try:
+                    registry.get("on_error", _handle_market_monitor_error)(exc)
+                except Exception as handler_error:
+                    app.logger.error("Market monitor error handler failed (%s)",
+                                     type(handler_error).__name__)
         time.sleep(max(1, int(registry.get("interval", 60))))
 
 
@@ -631,7 +644,7 @@ def start_monitor():
     with registry["lock"]:
         registry["cycle"] = process_market_cycle
         registry["interval"] = REFRESH_SECONDS
-        registry["on_error"] = lambda exc: engine.set_market_warning(f"Market monitor error: {exc}")
+        registry["on_error"] = _handle_market_monitor_error
         existing = registry.get("thread")
         if existing is not None and existing.is_alive():
             registry["started"] = True
