@@ -144,9 +144,14 @@ def _analyze_market_uncached(symbol, ticker):
         candidate_close = candidate["Close"]
         if isinstance(candidate_close, pd.DataFrame):
             candidate_close = candidate_close.iloc[:, 0]
-        candle_count = len(candidate_close.dropna())
+        candidate_close = pd.to_numeric(candidate_close, errors="coerce")
+        candidate_close = candidate_close[
+            candidate_close.map(lambda value: math.isfinite(float(value)) and float(value) > 0)]
+        candidate_close = candidate_close[
+            ~candidate_close.index.duplicated(keep="last")].sort_index()
+        candle_count = len(candidate_close)
         if candle_count < 35:
-            yahoo_errors.append(f"Yahoo {interval} returned only {candle_count} candles; 35 required")
+            yahoo_errors.append(f"Yahoo {interval} returned only {candle_count} valid candles; 35 required")
             continue
         df = candidate
         data_interval = interval
