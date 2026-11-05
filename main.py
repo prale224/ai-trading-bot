@@ -128,7 +128,7 @@ def _analyze_market_uncached(symbol, ticker):
     df = None
     data_interval = None
     data_source = None
-    yahoo_error = None
+    yahoo_errors = []
     for interval in ("2m", "1m"):
         try:
             candidate = ticker_client.history(period="5d", interval=interval, actions=False,
@@ -136,15 +136,17 @@ def _analyze_market_uncached(symbol, ticker):
         except Exception as exc:
             if is_rate_limit_error(exc):
                 raise
-            yahoo_error = f"Yahoo request failed ({type(exc).__name__})"
+            yahoo_errors.append(f"Yahoo {interval} request failed ({type(exc).__name__})")
             continue
         if candidate.empty:
+            yahoo_errors.append(f"Yahoo returned no {interval} candles")
             continue
         candidate_close = candidate["Close"]
         if isinstance(candidate_close, pd.DataFrame):
             candidate_close = candidate_close.iloc[:, 0]
-        if len(candidate_close.dropna()) < 35:
-            yahoo_error = "Yahoo returned fewer than 35 candles"
+        candle_count = len(candidate_close.dropna())
+        if candle_count < 35:
+            yahoo_errors.append(f"Yahoo {interval} returned only {candle_count} candles; 35 required")
             continue
         df = candidate
         data_interval = interval
@@ -156,6 +158,7 @@ def _analyze_market_uncached(symbol, ticker):
             data_interval = "1m"
             data_source = "Massive"
         else:
+            yahoo_error = "; ".join(yahoo_errors) or None
             error = massive_error or yahoo_error or "No market data from Yahoo Finance or Massive"
             return {"symbol": symbol, "signal": "WAIT", "error": error, "updated": None}
     close = df["Close"]
