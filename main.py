@@ -441,12 +441,24 @@ def health():
     risk = engine.risk_status()
     now = datetime.now(timezone.utc)
     with market_lock:
-        current = [current_market_snapshot(market, now) for market in markets.values()]
-    has_fresh_market = any(fresh_market_quote(market, now) is not None for market in current)
+        current = {symbol: current_market_snapshot(market, now)
+                   for symbol, market in markets.items()}
+    market_data = {}
+    for symbol in SYMBOLS:
+        market = current.get(symbol)
+        quote = fresh_market_quote(market, now) if market is not None else None
+        market_data[symbol] = {
+            "status": market.get("data_status", "unavailable") if market is not None else "unavailable",
+            "updated": market.get("updated") if market is not None else None,
+            "data_age_seconds": market.get("data_age_seconds") if market is not None else None,
+            "fresh": quote is not None,
+        }
+    all_markets_fresh = all(item["fresh"] for item in market_data.values())
     status = "starting" if not monitor_started else "degraded" if (
         risk.get("storage_failed") or risk.get("market_warning")
-        or risk.get("valuation_warning") or not has_fresh_market) else "healthy"
-    return jsonify({"status": status, "mode": "PAPER_ONLY", "risk": risk})
+        or risk.get("valuation_warning") or not all_markets_fresh) else "healthy"
+    return jsonify({"status": status, "mode": "PAPER_ONLY", "risk": risk,
+                    "markets": market_data})
 
 
 def paper_result_status(result):
