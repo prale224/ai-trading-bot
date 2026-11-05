@@ -79,6 +79,8 @@ def _fetch_massive_history(symbol):
     massive_ticker = {"US100": "I:NDX", "US500": "I:SPX"}.get(symbol)
     if not api_key or not massive_ticker:
         return None, None
+    if os.environ.get("MASSIVE_STRATEGY_LICENSE_CONFIRMED", "").strip().lower() != "true":
+        return None, "Massive fallback disabled until data-use rights are confirmed"
 
     end_date = datetime.now(timezone.utc).date()
     start_date = end_date - timedelta(days=5)
