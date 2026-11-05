@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
 from flask import Flask, jsonify, render_template_string, request
 import builtins
 import hashlib
@@ -11,6 +12,9 @@ import os
 import sys
 import threading
 import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 import pandas as pd
 import yfinance as yf
 
@@ -69,22 +73,70 @@ def calculate_rsi(series, period=14):
     return 100 - 100/(1+rs)
 
 
+def _fetch_massive_history(symbol):
+    """Fetch index minute bars from Massive when an API key is explicitly configured."""
+    api_key = os.environ.get("MASSIVE_API_KEY", "").strip()
+    massive_ticker = {"US100": "I:NDX", "US500": "I:SPX"}.get(symbol)
+    if not api_key or not massive_ticker:
+        return None, None
+
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=5)
+    url = (f"https://api.massive.com/v2/aggs/ticker/{quote(massive_ticker, safe='')}"
+           f"/range/1/minute/{start_date.isoformat()}/{end_date.isoformat()}"
+           "?adjusted=false&sort=asc&limit=50000")
+    request = Request(url, headers={"Authorization": f"Bearer {api_key}"})
+    try:
+        with urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        return None, f"Massive HTTP {exc.code}"
+    except (URLError, TimeoutError, OSError, ValueError):
+        return None, "Massive request failed"
+
+    bars = payload.get("results")
+    if payload.get("status") != "OK" or not isinstance(bars, list) or not bars:
+        return None, "Massive returned no index bars"
+    try:
+        frame = pd.DataFrame(bars)
+        frame["Close"] = pd.to_numeric(frame["c"], errors="coerce")
+        frame.index = pd.to_datetime(frame["t"], unit="ms", utc=True).tz_convert("America/New_York")
+        frame = frame[["Close"]].dropna()
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None, "Massive returned invalid index bars"
+    return frame, None
+
+
 def _analyze_market_uncached(symbol, ticker):
-    # Two-minute bars have a longer Yahoo intraday retention window than 1m.
-    # Fall back to 1m only when Yahoo has no 2m bars; never substitute a different instrument.
+    # Two-minute bars reduce Yahoo's dependence on the shortest intraday history.
+    # If Yahoo has no usable bars, use the configured independent index provider.
     ticker_client = yf.Ticker(ticker)
     df = None
     data_interval = None
+    data_source = None
+    yahoo_error = None
     for interval in ("2m", "1m"):
-        candidate = ticker_client.history(period="5d", interval=interval, actions=False,
-                                          auto_adjust=True, timeout=10)
+        try:
+            candidate = ticker_client.history(period="5d", interval=interval, actions=False,
+                                              auto_adjust=True, timeout=10)
+        except Exception as exc:
+            if is_rate_limit_error(exc):
+                raise
+            yahoo_error = f"Yahoo request failed ({type(exc).__name__})"
+            continue
         if not candidate.empty:
             df = candidate
             data_interval = interval
+            data_source = "Yahoo Finance"
             break
     if df is None:
-        return {"symbol": symbol, "signal": "WAIT",
-                "error": "No Yahoo market data at 2m or 1m interval", "updated": None}
+        df, massive_error = _fetch_massive_history(symbol)
+        if df is not None:
+            data_interval = "1m"
+            data_source = "Massive"
+        else:
+            error = massive_error or yahoo_error or "No market data from Yahoo Finance or Massive"
+            return {"symbol": symbol, "signal": "WAIT", "error": error, "updated": None}
     close = df["Close"]
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
@@ -108,7 +160,7 @@ def _analyze_market_uncached(symbol, ticker):
         elif ema9.iloc[-1] < ema21.iloc[-1] and macd.iloc[-1] < macd_signal.iloc[-1] and 30 < rv < 50:
             signal = "SELL"
     return {"symbol": symbol, "price": float(close.iloc[-1]), "signal": signal,
-            "data_interval": data_interval,
+            "data_interval": data_interval, "data_source": data_source,
             "rsi": round(rv, 2) if pd.notna(rv) else None, "ema9": float(ema9.iloc[-1]),
             "ema21": float(ema21.iloc[-1]), "macd": float(macd.iloc[-1]),
             "updated": updated, "data_age_seconds": age, "spread_rate": config.assumed_spread_rate,
