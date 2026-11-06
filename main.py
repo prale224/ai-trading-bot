@@ -476,7 +476,15 @@ def status():
     prices = {symbol: quote[0] for symbol, quote in fresh_quotes.items()}
     price_timestamps = {symbol: current[symbol].get("updated") for symbol in fresh_quotes}
     data = engine.snapshot(prices, timestamps=price_timestamps)
-    data.update({"name": "AI Trading Bot V3", "mode": "PAPER TRADING ONLY", "status": "RUNNING" if monitor_started else "STARTING",
+    market_status_fresh = all(
+        symbol in current and fresh_market_quote(current[symbol], now) is not None
+        for symbol in SYMBOLS)
+    risk_status = data.get("risk", {})
+    dashboard_status = ("STARTING" if not monitor_started else
+                        "DEGRADED" if (not market_status_fresh or risk_status.get("storage_failed")
+                                       or risk_status.get("market_warning")
+                                       or risk_status.get("valuation_warning")) else "RUNNING")
+    data.update({"name": "AI Trading Bot V3", "mode": "PAPER TRADING ONLY", "status": dashboard_status,
                  "starting_capital": engine.state["starting_balance"], "markets": current,
                  "currency": PAPER_CURRENCY,
                  "positions": data["positions"], "last_update": max((m.get("updated") or "" for m in current.values()), default=None),
