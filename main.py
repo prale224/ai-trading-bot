@@ -534,6 +534,10 @@ def health():
             "updated": market.get("updated") if market is not None else None,
             "data_age_seconds": market.get("data_age_seconds") if market is not None else None,
             "fresh": quote is not None,
+            "data_source": market.get("data_source") if market is not None else None,
+            "data_interval": market.get("data_interval") if market is not None else None,
+            "last_success_at": market.get("last_success_at") if market is not None else None,
+            "fetch_warning": bool(market.get("fetch_error")) if market is not None else False,
         }
     all_markets_fresh = all(item["fresh"] for item in market_data.values())
     status = "starting" if not monitor_started else "degraded" if (
