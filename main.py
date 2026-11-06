@@ -113,12 +113,28 @@ def _fetch_massive_history(symbol):
         return None, "Massive returned no index bars"
     try:
         frame = pd.DataFrame(bars)
-        frame["Close"] = pd.to_numeric(frame["c"], errors="coerce")
+        for column, provider_key in (("Open", "o"), ("High", "h"), ("Low", "l"), ("Close", "c")):
+            frame[column] = pd.to_numeric(frame[provider_key], errors="coerce")
         frame.index = pd.to_datetime(frame["t"], unit="ms", utc=True).dt.tz_convert("America/New_York")
-        frame = frame[["Close"]].dropna()
+        frame = frame[["Open", "High", "Low", "Close"]].dropna(subset=["Close"])
     except (KeyError, TypeError, ValueError, OverflowError):
         return None, "Massive returned invalid index bars"
     return frame, None
+
+
+def _latest_bar_value(frame, timestamp, column):
+    """Return a finite positive OHLC value for a source candle, when available."""
+    try:
+        values = frame[column]
+        if isinstance(values, pd.DataFrame):
+            values = values.iloc[:, 0]
+        raw = values.loc[timestamp]
+        if isinstance(raw, pd.Series):
+            raw = raw.iloc[0]
+        value = float(pd.to_numeric(raw, errors="coerce"))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
 
 
 def _analyze_market_uncached(symbol, ticker):
@@ -206,6 +222,9 @@ def _analyze_market_uncached(symbol, ticker):
         elif ema9_value < ema21_value and macd_value < macd_signal_value and 30 < rv < 50:
             signal = "SELL"
     return {"symbol": symbol, "price": price_value, "signal": signal,
+            "bar_open": _latest_bar_value(df, timestamp, "Open"),
+            "bar_high": _latest_bar_value(df, timestamp, "High"),
+            "bar_low": _latest_bar_value(df, timestamp, "Low"),
             "data_interval": data_interval, "data_source": data_source,
             "rsi": round(rv, 2) if math.isfinite(rv) else None, "ema9": ema9_value,
             "ema21": ema21_value, "macd": macd_value,
@@ -318,7 +337,17 @@ def process_market_cycle():
                    if (quote := fresh_market_quote(market)) is not None}
     exit_prices = {symbol: quote[0] for symbol, quote in exit_quotes.items()}
     exit_timestamps = {symbol: results[symbol].get("updated") for symbol in exit_quotes}
-    exit_results = engine.check_exits(exit_prices, timestamps=exit_timestamps)
+    exit_bars = {
+        symbol: {
+            "open": results[symbol].get("bar_open"),
+            "high": results[symbol].get("bar_high"),
+            "low": results[symbol].get("bar_low"),
+            "timestamp": results[symbol].get("updated"),
+        }
+        for symbol in exit_quotes
+    }
+    exit_results = engine.check_exits(
+        exit_prices, timestamps=exit_timestamps, bars=exit_bars)
     closed_symbols_this_cycle = {result["trade"]["symbol"] for result in exit_results
                                  if result.get("ok") and result.get("trade", {}).get("symbol")}
     stale_symbols = [symbol for symbol, market in results.items()
