@@ -523,8 +523,9 @@ class PaperRiskEngine:
             return self.close_position(symbol, market_price, "REVERSE_SIGNAL",
                                         signal_id=signal_id, signal_outcome=signal_outcome)
 
-    def check_exits(self, prices, timestamps=None):
+    def check_exits(self, prices, timestamps=None, bars=None):
         closed = []
+        bars = bars if isinstance(bars, dict) else {}
         with self.lock:
             fresh_marks = self._fresh_price_marks(prices, timestamps)
             for symbol, pos in list(self.positions.items()):
@@ -532,12 +533,42 @@ class PaperRiskEngine:
                 if mark is None:
                     continue
                 price = mark["price"]
+                bar = bars.get(symbol)
+                bar_open = self._valid_price(bar.get("open")) if isinstance(bar, dict) else None
+                bar_high = self._valid_price(bar.get("high")) if isinstance(bar, dict) else None
+                bar_low = self._valid_price(bar.get("low")) if isinstance(bar, dict) else None
+                bar_time = self._parse_market_timestamp(bar.get("timestamp")) if isinstance(bar, dict) else None
+                opened_at = self._parse_market_timestamp(pos.get("opened_at"))
+                usable_range = (
+                    bar_open is not None and bar_high is not None and bar_low is not None
+                    and bar_low <= bar_open <= bar_high
+                    and bar_low <= price <= bar_high
+                    and bar_time is not None and opened_at is not None
+                    and opened_at <= bar_time
+                )
+                exit_price = price
                 if pos["side"] == "BUY":
-                    reason = "STOP_LOSS" if price <= pos["stop_loss"] else "TAKE_PROFIT" if price >= pos["take_profit"] else None
+                    if usable_range and bar_low <= pos["stop_loss"]:
+                        reason = "STOP_LOSS"
+                        exit_price = min(bar_open, pos["stop_loss"])
+                    elif usable_range and bar_high >= pos["take_profit"]:
+                        reason = "TAKE_PROFIT"
+                        exit_price = max(bar_open, pos["take_profit"])
+                    else:
+                        reason = ("STOP_LOSS" if price <= pos["stop_loss"]
+                                  else "TAKE_PROFIT" if price >= pos["take_profit"] else None)
                 else:
-                    reason = "STOP_LOSS" if price >= pos["stop_loss"] else "TAKE_PROFIT" if price <= pos["take_profit"] else None
+                    if usable_range and bar_high >= pos["stop_loss"]:
+                        reason = "STOP_LOSS"
+                        exit_price = max(bar_open, pos["stop_loss"])
+                    elif usable_range and bar_low <= pos["take_profit"]:
+                        reason = "TAKE_PROFIT"
+                        exit_price = min(bar_open, pos["take_profit"])
+                    else:
+                        reason = ("STOP_LOSS" if price >= pos["stop_loss"]
+                                  else "TAKE_PROFIT" if price <= pos["take_profit"] else None)
                 if reason:
-                    result = self.close_position(symbol, price, reason)
+                    result = self.close_position(symbol, exit_price, reason)
                     if not result.get("ok"):
                         result = {**result, "symbol": symbol}
                     closed.append(result)
