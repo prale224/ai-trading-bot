@@ -38,16 +38,20 @@ def service(tmp_path, monkeypatch):
     return main, client
 
 
-def test_read_only_http_routes_and_dashboard(service):
+def test_read_only_http_routes_and_dashboard(service, monkeypatch):
     main, client = service
+    monkeypatch.setattr(main, "us_cash_session_open", lambda now=None: False)
     assert client.get("/").status_code == 200
     assert b"PAPER TRADING ONLY" in client.get("/dashboard").data
     dashboard = client.get("/dashboard").data
     assert "poslednja greška".encode() in dashboard
     assert "sledeći pokušaj za".encode() in dashboard
     assert "starost cene".encode() in dashboard
-    assert client.get("/health").json["mode"] == "PAPER_ONLY"
-    assert "risk" not in client.get("/health").json
+    assert "US sesija (standardni sat)".encode() in dashboard
+    health = client.get("/health").json
+    assert health["mode"] == "PAPER_ONLY"
+    assert health["us_cash_session_clock_open"] is False
+    assert "risk" not in health
     anonymous = main.app.test_client()
     for path in ("/status", "/signals", "/positions", "/trades"):
         assert anonymous.get(path).status_code == 401
@@ -56,6 +60,7 @@ def test_read_only_http_routes_and_dashboard(service):
     assert status.json["mode"] == "PAPER TRADING ONLY"
     assert status.json["balance"] == 100
     assert status.json["currency"] == "EUR"
+    assert status.json["us_cash_session_clock_open"] is False
     assert client.get("/signals").json["US100"]["signal"] == "WAIT"
     assert client.get("/positions").json == {}
     assert client.get("/trades").json == []

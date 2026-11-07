@@ -491,7 +491,7 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 function showAuth(message=''){document.getElementById('access').hidden=false;document.getElementById('dashboard').hidden=true;document.getElementById('authError').textContent=message}
 async function load(){const token=sessionStorage.getItem('paperApiToken');if(!token){showAuth('');return}try{const r=await fetch('/status',{headers:{Authorization:'Bearer '+token}});if(r.status===401){sessionStorage.removeItem('paperApiToken');showAuth('Token nije prihvaćen');return}if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();const money=n=>n==null?'Privremeno nedostupno':Number(n).toFixed(2)+' '+(d.currency||'EUR');
 document.getElementById('access').hidden=true;document.getElementById('dashboard').hidden=false;
-document.getElementById('summary').innerHTML=[['Stanje',money(d.balance)],['Vrednost računa',money(d.equity)],['Realizovani P/L',money(d.realized_pnl)],['Nerealizovani P/L',money(d.unrealized_pnl)],['Dnevni gubitak',money(d.risk?.daily_loss_used)],['Dnevni limit',money(d.risk?.daily_loss_limit)],['Novi ulasci',d.risk?.new_entries_blocked?'BLOKIRANI':'DOZVOLJENI'],['Režim',d.mode],['Emergency STOP',d.risk?.emergency_stop?'AKTIVAN':'isključen']].map(x=>'<div class="card"><div class="muted">'+esc(x[0])+'</div><div class="value">'+esc(x[1])+'</div></div>').join('');
+document.getElementById('summary').innerHTML=[['Stanje',money(d.balance)],['Vrednost računa',money(d.equity)],['Realizovani P/L',money(d.realized_pnl)],['Nerealizovani P/L',money(d.unrealized_pnl)],['Dnevni gubitak',money(d.risk?.daily_loss_used)],['Dnevni limit',money(d.risk?.daily_loss_limit)],['Novi ulasci',d.risk?.new_entries_blocked?'BLOKIRANI':'DOZVOLJENI'],['Režim',d.mode],['US sesija (standardni sat)',d.us_cash_session_clock_open?'u terminu':'van termina'],['Emergency STOP',d.risk?.emergency_stop?'AKTIVAN':'isključen']].map(x=>'<div class="card"><div class="muted">'+esc(x[0])+'</div><div class="value">'+esc(x[1])+'</div></div>').join('');
 document.getElementById('warning').textContent=[d.risk?.storage_warning,d.risk?.market_warning,d.risk?.valuation_warning,d.risk?.pause_reason].filter(Boolean).join(' · ');
 document.getElementById('markets').innerHTML=Object.values(d.markets).map(m=>'<p><b>'+esc(m.symbol)+'</b> · '+(m.price!=null?esc(m.price):m.last_known_price!=null?'poslednja poznata: '+esc(m.last_known_price):'cena nedostupna')+' · <b class="'+(m.signal==='BUY'?'buy':m.signal==='SELL'?'sell':'')+'">'+esc(m.signal)+'</b> · RSI '+esc(m.rsi??'—')+(m.data_age_seconds!=null?' · starost cene '+Math.round(m.data_age_seconds)+'s':' · starost cene nepoznata')+(m.data_source?' · izvor '+esc(m.data_source):'')+(m.data_interval?' · sveća '+esc(m.data_interval):'')+(m.error?' · '+esc(m.error):'')+(m.fetch_error?' · poslednja greška: '+esc(m.fetch_error):'')+(m.retry_after_seconds>0?' · sledeći pokušaj za '+Math.ceil(m.retry_after_seconds)+'s':'')+(m.last_success_at?' · poslednji uspeh '+esc(m.last_success_at):'')+(m.execution_status?' · izvršenje: '+esc(m.execution_status)+(m.execution_reason?' ('+esc(m.execution_reason)+')':''):'')+'</p>').join('')||'Nema podataka';
 document.getElementById('positions').innerHTML=Object.values(d.positions).map(p=>'<p><b>'+esc(p.symbol)+' '+esc(p.side)+'</b> · ulaz '+esc(p.entry_price)+' · količina '+esc(p.quantity)+'<br>Stop Loss: '+esc(p.stop_loss)+' · Take Profit: '+esc(p.take_profit)+'<br>Trenutna cena: '+(p.current_price==null?'nepotvrđena':esc(Number(p.current_price).toFixed(2)))+' · Nerealizovani P/L: '+esc(money(p.unrealized_pnl))+(p.valuation_warning?'<br><span class="warning">'+esc(p.valuation_warning)+'</span>':'')+'</p>').join('')||'Nema otvorenih pozicija';
@@ -531,7 +531,7 @@ def status():
                                        or risk_status.get("valuation_warning")) else "RUNNING")
     data.update({"name": "AI Trading Bot V3", "mode": "PAPER TRADING ONLY", "status": dashboard_status,
                  "starting_capital": engine.state["starting_balance"], "markets": current,
-                 "currency": PAPER_CURRENCY,
+                 "currency": PAPER_CURRENCY, "us_cash_session_clock_open": us_cash_session_open(now),
                  "positions": data["positions"], "last_update": max((m.get("updated") or "" for m in current.values()), default=None),
                  "last_error": next((m.get("fetch_error") or m.get("error") for m in current.values()
                                      if m.get("fetch_error") or m.get("error")), None)})
@@ -589,6 +589,7 @@ def health():
         risk.get("storage_failed") or risk.get("market_warning")
         or risk.get("valuation_warning") or not all_markets_fresh) else "healthy"
     return jsonify({"status": status, "mode": "PAPER_ONLY",
+                    "us_cash_session_clock_open": us_cash_session_open(now),
                     "markets": market_data})
 
 
