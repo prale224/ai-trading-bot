@@ -245,6 +245,11 @@ class MarketDataCache:
             self._provider_cooldown_until = 0.0
             return self._snapshot(symbol, fetched_monotonic)
 
+    def cached_snapshot(self, symbol):
+        """Return the latest cache state without attempting a provider fetch."""
+        with self._lock:
+            return self._snapshot(symbol, self._monotonic())
+
     @property
     def rate_limit_count(self):
         with self._lock:
