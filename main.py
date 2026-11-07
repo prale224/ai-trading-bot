@@ -15,6 +15,7 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import pandas as pd
 import yfinance as yf
 
@@ -232,7 +233,22 @@ def _analyze_market_uncached(symbol, ticker):
             "spread_source": "configured paper estimate (yfinance does not provide bid/ask)"}
 
 
+def us_cash_session_open(now=None):
+    """Return whether the standard U.S. cash-index session clock is open."""
+    try:
+        current = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+    except ZoneInfoNotFoundError:
+        # Preserve provider behavior when local timezone data is unavailable.
+        return True
+    minute_of_day = current.hour * 60 + current.minute
+    return current.weekday() < 5 and 9 * 60 + 30 <= minute_of_day < 16 * 60
+
+
 def analyze_market(symbol, ticker):
+    if not us_cash_session_open():
+        cached = market_data_cache.cached_snapshot(symbol)
+        if cached.get("data_status") != "fresh":
+            return cached
     return market_data_cache.get(symbol, lambda: _analyze_market_uncached(symbol, ticker))
 
 
