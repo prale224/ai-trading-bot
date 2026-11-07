@@ -63,6 +63,7 @@ def test_read_only_http_routes_and_dashboard(service):
 
 def test_yfinance_history_rate_limit_reaches_provider_backoff(service, monkeypatch):
     main, _ = service
+    monkeypatch.setattr(main, "us_cash_session_open", lambda: True)
     calls = []
 
     class FakeTicker:
@@ -73,10 +74,41 @@ def test_yfinance_history_rate_limit_reaches_provider_backoff(service, monkeypat
     monkeypatch.setattr(main.yf, "Ticker", lambda ticker: FakeTicker())
     result = main.analyze_market("US100", "^NDX")
 
-    assert calls == [{"period": "5d", "interval": "1m", "actions": False,
+    assert calls == [{"period": "5d", "interval": "2m", "actions": False,
                       "auto_adjust": True, "timeout": 10}]
     assert "Yahoo Finance HTTP 429" in result["fetch_error"]
     assert result["retry_after_seconds"] > 0
+
+
+def test_us_cash_session_clock_handles_dst_and_closed_periods(service):
+    main, _ = service
+    assert main.us_cash_session_open(datetime(2026, 7, 6, 13, 30, tzinfo=timezone.utc))
+    assert main.us_cash_session_open(datetime(2026, 11, 6, 14, 30, tzinfo=timezone.utc))
+    assert not main.us_cash_session_open(datetime(2026, 11, 6, 21, 0, tzinfo=timezone.utc))
+    assert not main.us_cash_session_open(datetime(2026, 11, 7, 14, 30, tzinfo=timezone.utc))
+
+
+def test_closed_session_skips_provider_when_market_data_is_stale_or_unavailable(service, monkeypatch):
+    main, _ = service
+    stale_timestamp = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    main.market_data_cache.get("US100", lambda: {
+        "symbol": "US100", "price": 20000.0, "signal": "WAIT", "updated": stale_timestamp,
+    })
+    monkeypatch.setattr(main, "us_cash_session_open", lambda: False)
+    provider_calls = []
+
+    def unexpected_provider_call(symbol, ticker):
+        provider_calls.append((symbol, ticker))
+        raise AssertionError("provider must not be called outside the cash session")
+
+    monkeypatch.setattr(main, "_analyze_market_uncached", unexpected_provider_call)
+    stale = main.analyze_market("US100", "^NDX")
+    unavailable = main.analyze_market("US500", "^GSPC")
+
+    assert provider_calls == []
+    assert stale["data_status"] == "stale"
+    assert main.fresh_market_quote(stale) is None
+    assert unavailable["data_status"] == "unavailable"
 
 
 def test_market_data_timing_defaults_remain_aligned(service, monkeypatch):
@@ -97,7 +129,9 @@ def test_paper_currency_can_be_configured_explicitly(service, monkeypatch):
     monkeypatch.setenv("PAPER_CURRENCY", "CAD")
     main = importlib.reload(main)
     monkeypatch.setattr(main, "start_monitor", lambda: None)
-    assert main.app.test_client().get("/status").json["currency"] == "CAD"
+    client = main.app.test_client()
+    client.environ_base["HTTP_AUTHORIZATION"] = "Bearer integration-test-token-with-at-least-32-characters"
+    assert client.get("/status").json["currency"] == "CAD"
 
 
 def test_health_requires_fresh_data_for_each_market(service):
@@ -356,6 +390,7 @@ def test_fresh_price_crossing_stop_loss_still_closes_position(service, monkeypat
 
 def test_stale_cached_price_below_stop_loss_never_closes_position(service, monkeypatch):
     main, _ = service
+    monkeypatch.setattr(main, "us_cash_session_open", lambda: True)
     opened = main.engine.open_position("US100", "BUY", 20000, signal_id="cache-stale-exit",
                                         spread_rate=0.0002, data_age_seconds=1)
     assert opened["ok"]
