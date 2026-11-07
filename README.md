@@ -36,4 +36,4 @@ The PAPER account read APIs and control endpoints require the bearer token. Cont
 
 ## Tests
 
-Run `python -m unittest discover -s tests -v`. Tests use temporary SQLite files and do not fetch market data or submit orders.
+Install development/test dependencies with `pip install -r requirements-dev.txt`, then run `python -m pytest -q`. The suite uses temporary SQLite files and does not fetch market data or submit orders.
