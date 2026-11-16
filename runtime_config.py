@@ -1,4 +1,5 @@
 """Fail-closed runtime configuration checks for the PAPER-only web app."""
+import hmac
 import os
 from pathlib import Path
 
@@ -8,6 +9,7 @@ EPHEMERAL_DB_PATH = "/tmp/paper_trading.sqlite3"
 def validate_runtime_environment(environ=None):
     environ = os.environ if environ is None else environ
     token = environ.get("PAPER_API_TOKEN", "").strip()
+    yarvis_order_token = environ.get("YARVIS_PAPER_ORDER_TOKEN", "").strip()
     db_path = environ.get("PAPER_DB_PATH", "").strip()
     allow_ephemeral_db = environ.get("PAPER_ALLOW_EPHEMERAL_DB", "").strip().lower() == "true"
     if allow_ephemeral_db:
@@ -19,6 +21,11 @@ def validate_runtime_environment(environ=None):
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
     if len(token) < 32:
         raise RuntimeError("PAPER_API_TOKEN must contain at least 32 characters")
+    if yarvis_order_token:
+        if len(yarvis_order_token) < 32:
+            raise RuntimeError("YARVIS_PAPER_ORDER_TOKEN must contain at least 32 characters")
+        if hmac.compare_digest(yarvis_order_token, token):
+            raise RuntimeError("YARVIS_PAPER_ORDER_TOKEN must differ from PAPER_API_TOKEN")
     # Render paths use POSIX syntax; accept that syntax in Windows-based CI too.
     if not (Path(db_path).is_absolute() or db_path.startswith("/")):
         raise RuntimeError("PAPER_DB_PATH must be an absolute path")

@@ -34,6 +34,14 @@ Automatic PAPER stop-loss and take-profit checks use the fresh candle's OHLC ran
 
 The PAPER account read APIs and control endpoints require the bearer token. Control endpoints are `POST /paper/emergency-stop`, `POST /paper/resume`, `POST /paper/orders`, and `POST /paper/positions/<symbol>/close`; these routes only change simulator state. Emergency STOP is persisted and blocks new positions until explicitly resumed; the daily-loss limit cannot be resumed while still breached. The API token is never included in application log messages, URLs, or the Render Blueprint.
 
+### Yarvis PAPER order tool
+
+`YARVIS_PAPER_ORDER_TOKEN` is an optional, separate bearer token accepted only by `POST /paper/orders`. It must be at least 32 characters and differ from `PAPER_API_TOKEN`. It cannot read account data, stop or resume the simulator, or close a position. The existing full PAPER token remains required for all account reads and other controls.
+
+`tools/yarvis_paper_mcp.py` is a local, dependency-free MCP stdio server for OpenJarvis. It exposes only `yarvis_open_paper_order(symbol, side)`, pins requests to the existing paid PAPER service, reads the scoped token from the current Windows user's Credential Manager, and sends no caller-supplied price or quantity. Before opening a simulated order it requires `/health` to report `healthy`, `PAPER_ONLY`, an open standard U.S. cash session, and a fresh quote for the selected symbol. The bot still applies its own freshness, position-sizing, spread, balance, and risk limits. Discovery and health checks never submit an order. The tool does not provide reads, stop/resume, close, or live-broker operations.
+
+OpenJarvis can launch this bridge as a local stdio MCP server. Configure `[tools.mcp]` with this script, whitelist `yarvis_open_paper_order`, and add that name only to the intended managed agent's tool list. Keep the API credential in Windows Credential Manager; do not put it in the OpenJarvis TOML config or command-line arguments. The bridge's `--provision-key` mode is intended to be captured directly into the service environment-variable store and should never be run in a terminal that displays or records its stdout.
+
 ## Tests
 
 Install development/test dependencies with `pip install -r requirements-dev.txt`, then run `python -m pytest -q`. The suite uses temporary SQLite files and does not fetch market data or submit orders.

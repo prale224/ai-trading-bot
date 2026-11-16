@@ -611,6 +611,19 @@ def require_paper_token():
         return False
 
 
+def require_paper_order_token():
+    """Accept the full PAPER token or the order-only Yarvis token."""
+    supplied = request.headers.get("Authorization", "")
+    tokens = (os.environ.get("PAPER_API_TOKEN", "").strip(),
+              os.environ.get("YARVIS_PAPER_ORDER_TOKEN", "").strip())
+    try:
+        supplied_bytes = supplied.encode("utf-8")
+        return any(token and hmac.compare_digest(
+            supplied_bytes, f"Bearer {token}".encode("utf-8")) for token in tokens)
+    except (AttributeError, UnicodeEncodeError):
+        return False
+
+
 @app.post("/paper/emergency-stop")
 def emergency_stop():
     if not require_paper_token():
@@ -634,7 +647,7 @@ def resume_paper():
 
 @app.post("/paper/orders")
 def manual_paper_order():
-    if not require_paper_token():
+    if not require_paper_order_token():
         return jsonify({"ok": False, "reason": "PAPER_API_TOKEN_REQUIRED"}), 401
     body = request.get_json(silent=True)
     if not isinstance(body, dict):

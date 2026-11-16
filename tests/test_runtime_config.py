@@ -26,6 +26,22 @@ def test_required_runtime_settings_are_fail_closed(tmp_path):
     assert "token" not in accepted
 
 
+def test_yarvis_order_token_is_optional_strong_distinct_and_never_returned(tmp_path):
+    base = {"PAPER_API_TOKEN": TOKEN, "PAPER_DB_PATH": str(tmp_path / "db.sqlite")}
+    assert validate_runtime_environment(base)["paper_only"] is True
+
+    scoped = "yarvis-paper-order-token-with-at-least-32-characters"
+    accepted = validate_runtime_environment({**base, "YARVIS_PAPER_ORDER_TOKEN": scoped})
+    assert accepted["paper_only"] is True
+    assert scoped not in str(accepted)
+    assert "yarvis_paper_order_token" not in accepted
+
+    with pytest.raises(RuntimeError, match="YARVIS_PAPER_ORDER_TOKEN.*32 characters"):
+        validate_runtime_environment({**base, "YARVIS_PAPER_ORDER_TOKEN": "too-short"})
+    with pytest.raises(RuntimeError, match="must differ"):
+        validate_runtime_environment({**base, "YARVIS_PAPER_ORDER_TOKEN": TOKEN})
+
+
 def test_wsgi_import_rejects_missing_required_environment(tmp_path):
     env = os.environ.copy()
     env.pop("PAPER_API_TOKEN", None)
@@ -103,7 +119,8 @@ def test_free_render_blueprint_is_separate_and_keeps_paid_blueprint_unchanged():
 
 def test_application_has_no_broker_sdk_or_order_submission_calls():
     root = Path(__file__).resolve().parents[1]
-    source_files = ("main.py", "database.py", "risk_engine.py", "runtime_config.py", "requirements.txt")
+    source_files = ("main.py", "database.py", "risk_engine.py", "runtime_config.py",
+                    "requirements.txt", "tools/yarvis_paper_mcp.py")
     forbidden = ("metatrader5", "alpaca", "ib_insync", "ccxt", "order_send(", "create_order(", "place_order(")
     for filename in source_files:
         contents = (root / filename).read_text(encoding="utf-8").lower()

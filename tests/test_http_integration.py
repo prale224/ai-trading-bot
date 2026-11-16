@@ -225,6 +225,28 @@ def test_protected_emergency_resume_and_manual_paper_trade(service):
     assert len(client.get("/trades").json) == 1
 
 
+def test_yarvis_token_is_limited_to_opening_paper_orders(service, monkeypatch):
+    main, _ = service
+    scoped_token = "yarvis-paper-order-token-with-at-least-32-characters"
+    monkeypatch.setenv("YARVIS_PAPER_ORDER_TOKEN", scoped_token)
+    client = main.app.test_client()
+    auth = {"Authorization": f"Bearer {scoped_token}"}
+
+    opened = client.post("/paper/orders", json={
+        "symbol": "US100", "side": "BUY", "signal_id": "yarvis-scoped-a",
+    }, headers=auth)
+    assert opened.status_code == 200
+
+    for path in ("/status", "/signals", "/positions", "/trades", "/paper/backup"):
+        assert client.get(path, headers=auth).status_code == 401
+    for path, payload in (("/paper/emergency-stop", {}), ("/paper/resume", {}),
+                          ("/paper/positions/US100/close", {})):
+        assert client.post(path, json=payload, headers=auth).status_code == 401
+
+    assert "US100" in main.engine.positions
+    assert main.engine.state["emergency_stop"] is False
+
+
 def test_stale_or_missing_market_data_blocks_new_positions(service, monkeypatch):
     main, _ = service
     monkeypatch.setattr(main, "analyze_market", lambda symbol, ticker: {
