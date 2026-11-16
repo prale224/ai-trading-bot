@@ -90,6 +90,22 @@ def test_http_redirects_are_not_followed():
     assert handler.redirect_request(None, None, 302, "Found", {}, "https://evil.example/") is None
 
 
+def test_local_credential_file_contains_only_dpapi_ciphertext(tmp_path, monkeypatch):
+    token = "unit-test-paper-token-with-at-least-32-characters"
+    credential_file = tmp_path / "yarvis-paper-order.dpapi"
+    monkeypatch.setattr(bridge, "CREDENTIAL_FILE", credential_file)
+    monkeypatch.setattr(bridge, "_dpapi_protect",
+                        lambda value: bytes(byte ^ 0xAA for byte in value))
+    monkeypatch.setattr(bridge, "_dpapi_unprotect",
+                        lambda value: bytes(byte ^ 0xAA for byte in value))
+
+    bridge.store_order_token(token)
+
+    assert credential_file.is_file()
+    assert token.encode("ascii") not in credential_file.read_bytes()
+    assert bridge.load_order_token() == token
+
+
 def test_tool_call_does_not_submit_during_discovery_and_uses_safe_result():
     tool_list = bridge.handle_message({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
     assert tool_list["result"]["tools"][0]["name"] == bridge.TOOL_NAME
@@ -119,4 +135,3 @@ def test_invalid_tool_arguments_do_not_invoke_order_executor():
     assert called == []
     assert response["result"]["isError"] is True
     assert "INVALID_ORDER" in response["result"]["content"][0]["text"]
-

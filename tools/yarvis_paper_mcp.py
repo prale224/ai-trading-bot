@@ -10,6 +10,7 @@ import json
 import os
 import secrets
 import sys
+from pathlib import Path
 import urllib.error
 import urllib.request
 import uuid
@@ -17,7 +18,7 @@ from ctypes import wintypes
 
 
 SERVICE_BASE_URL = "https://paper-trading-bot-jzgh.onrender.com"
-CREDENTIAL_TARGET = "YarvisPaperTradingOrderToken"
+CREDENTIAL_FILE = Path.home() / ".openjarvis" / "yarvis-paper-order.dpapi"
 TOOL_NAME = "yarvis_open_paper_order"
 PROTOCOL_VERSION = "2025-03-26"
 REQUEST_TIMEOUT_SECONDS = 12
@@ -41,46 +42,67 @@ class PaperToolError(Exception):
         self.message = message
 
 
-class _FileTime(ctypes.Structure):
-    _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+class _DataBlob(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
 
 
-class _Credential(ctypes.Structure):
-    _fields_ = [
-        ("Flags", wintypes.DWORD),
-        ("Type", wintypes.DWORD),
-        ("TargetName", wintypes.LPWSTR),
-        ("Comment", wintypes.LPWSTR),
-        ("LastWritten", _FileTime),
-        ("CredentialBlobSize", wintypes.DWORD),
-        ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
-        ("Persist", wintypes.DWORD),
-        ("AttributeCount", wintypes.DWORD),
-        ("Attributes", ctypes.c_void_p),
-        ("TargetAlias", wintypes.LPWSTR),
-        ("UserName", wintypes.LPWSTR),
-    ]
-
-
-def _credential_api():
+def _dpapi_api():
     if os.name != "nt":
         raise PaperToolError("CREDENTIAL_STORE_UNAVAILABLE",
-                             "This bridge requires Windows Credential Manager.")
-    advapi32 = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
-    advapi32.CredReadW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-        ctypes.POINTER(ctypes.POINTER(_Credential)),
+                             "This bridge requires Windows user-bound DPAPI storage.")
+    crypt32 = ctypes.WinDLL("Crypt32.dll", use_last_error=True)
+    crypt32.CryptProtectData.argtypes = [
+        ctypes.POINTER(_DataBlob), wintypes.LPCWSTR, ctypes.POINTER(_DataBlob),
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_DataBlob),
     ]
-    advapi32.CredReadW.restype = wintypes.BOOL
-    advapi32.CredWriteW.argtypes = [ctypes.POINTER(_Credential), wintypes.DWORD]
-    advapi32.CredWriteW.restype = wintypes.BOOL
-    advapi32.CredFree.argtypes = [ctypes.c_void_p]
-    advapi32.CredFree.restype = None
-    return advapi32
+    crypt32.CryptProtectData.restype = wintypes.BOOL
+    crypt32.CryptUnprotectData.argtypes = [
+        ctypes.POINTER(_DataBlob), ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(_DataBlob), ctypes.c_void_p, ctypes.c_void_p,
+        wintypes.DWORD, ctypes.POINTER(_DataBlob),
+    ]
+    crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    kernel32 = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    return crypt32, kernel32
+
+
+def _dpapi_protect(value):
+    crypt32, kernel32 = _dpapi_api()
+    source_bytes = (ctypes.c_ubyte * len(value)).from_buffer_copy(value)
+    source = _DataBlob(len(value), ctypes.cast(source_bytes, ctypes.POINTER(ctypes.c_ubyte)))
+    encrypted = _DataBlob()
+    if not crypt32.CryptProtectData(ctypes.byref(source), "Yarvis PAPER order token",
+                                    None, None, None, 1, ctypes.byref(encrypted)):
+        raise PaperToolError("CREDENTIAL_ENCRYPT_FAILED",
+                             f"Windows DPAPI could not encrypt the PAPER credential (error {ctypes.get_last_error()}).")
+    try:
+        return ctypes.string_at(encrypted.pbData, encrypted.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(encrypted.pbData, ctypes.c_void_p))
+
+
+def _dpapi_unprotect(value):
+    crypt32, kernel32 = _dpapi_api()
+    encrypted_bytes = (ctypes.c_ubyte * len(value)).from_buffer_copy(value)
+    encrypted = _DataBlob(len(value), ctypes.cast(encrypted_bytes, ctypes.POINTER(ctypes.c_ubyte)))
+    plaintext = _DataBlob()
+    description = wintypes.LPWSTR()
+    if not crypt32.CryptUnprotectData(ctypes.byref(encrypted), ctypes.byref(description),
+                                      None, None, None, 1, ctypes.byref(plaintext)):
+        raise PaperToolError("CREDENTIAL_DECRYPT_FAILED",
+                             f"Windows DPAPI could not decrypt the PAPER credential (error {ctypes.get_last_error()}).")
+    try:
+        return ctypes.string_at(plaintext.pbData, plaintext.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(plaintext.pbData, ctypes.c_void_p))
+        if description:
+            kernel32.LocalFree(ctypes.cast(description, ctypes.c_void_p))
 
 
 def store_order_token(token):
-    """Save a generated order-only token in the current Windows user vault."""
+    """Save a generated order-only token as current-user DPAPI ciphertext."""
     if not isinstance(token, str) or len(token) < 32:
         raise PaperToolError("INVALID_CREDENTIAL", "The generated credential is invalid.")
     try:
@@ -90,37 +112,31 @@ def store_order_token(token):
     if len(blob_bytes) > 512:
         raise PaperToolError("INVALID_CREDENTIAL", "The generated credential is invalid.")
 
-    api = _credential_api()
-    blob = (ctypes.c_ubyte * len(blob_bytes)).from_buffer_copy(blob_bytes)
-    credential = _Credential()
-    credential.Flags = 0
-    credential.Type = 1  # CRED_TYPE_GENERIC
-    credential.TargetName = CREDENTIAL_TARGET
-    credential.Comment = "Yarvis PAPER order access; only POST /paper/orders"
-    credential.CredentialBlobSize = len(blob_bytes)
-    credential.CredentialBlob = ctypes.cast(blob, ctypes.POINTER(ctypes.c_ubyte))
-    credential.Persist = 2  # CRED_PERSIST_LOCAL_MACHINE, scoped to this Windows user
-    credential.AttributeCount = 0
-    credential.Attributes = None
-    credential.TargetAlias = None
-    credential.UserName = "Yarvis PAPER order tool"
-    if not api.CredWriteW(ctypes.byref(credential), 0):
+    encrypted = _dpapi_protect(blob_bytes)
+    try:
+        CREDENTIAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CREDENTIAL_FILE.write_bytes(encrypted)
+    except OSError as exc:
+        error_code = exc.winerror or exc.errno or "unknown"
         raise PaperToolError("CREDENTIAL_STORE_WRITE_FAILED",
-                             "Windows Credential Manager could not save the PAPER credential.")
+                             "The encrypted PAPER credential could not be saved in the OpenJarvis data folder "
+                             f"(Windows error {error_code}).") from None
 
 
 def load_order_token():
-    """Read the scoped API token from the current Windows user's vault."""
-    api = _credential_api()
-    pointer = ctypes.POINTER(_Credential)()
-    if not api.CredReadW(CREDENTIAL_TARGET, 1, 0, ctypes.byref(pointer)):
-        raise PaperToolError("CREDENTIAL_MISSING",
-                             "The Yarvis PAPER credential is missing from Windows Credential Manager.")
+    """Read and decrypt the scoped API token for the current Windows user."""
     try:
-        credential = pointer.contents
-        blob = ctypes.string_at(credential.CredentialBlob, credential.CredentialBlobSize)
-    finally:
-        api.CredFree(pointer)
+        encrypted = CREDENTIAL_FILE.read_bytes()
+    except FileNotFoundError:
+        raise PaperToolError("CREDENTIAL_MISSING",
+                             "The Yarvis PAPER credential is missing from the OpenJarvis data folder.") from None
+    except OSError:
+        raise PaperToolError("CREDENTIAL_READ_FAILED",
+                             "The encrypted Yarvis PAPER credential could not be read.") from None
+    if not encrypted or len(encrypted) > 4096:
+        raise PaperToolError("CREDENTIAL_INVALID",
+                             "The encrypted Yarvis PAPER credential could not be read safely.")
+    blob = _dpapi_unprotect(encrypted)
     try:
         token = blob.decode("ascii")
     except UnicodeDecodeError:
@@ -330,4 +346,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
